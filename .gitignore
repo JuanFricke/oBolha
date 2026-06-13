@@ -1,0 +1,20 @@
+# Secrets
+.env
+.api
+
+# Output
+clips/
+*.mp4
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+.uv/
+
+# Tools
+.ruff_cache/
+.mypy_cache/
