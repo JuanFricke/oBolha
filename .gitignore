@@ -4,6 +4,8 @@
 
 # Output
 clips/
+reacts/
+data/
 *.mp4
 
 # Python

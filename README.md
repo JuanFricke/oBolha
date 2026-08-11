@@ -15,7 +15,9 @@ uv sync
 
 # Set your API key
 cp .env.example .env
-# edit .env and add your GROQ_API_KEY (free at https://console.groq.com)
+# Set your API key
+cp .env.example .env
+# Edit .env and add GROQ_API_KEY (console.groq.com) or GEMINI_API_KEY / ANTIGRAVITY_API_KEY
 ```
 
 System dependencies: `ffmpeg` and `yt-dlp` must be on your PATH.
@@ -30,6 +32,9 @@ brew install ffmpeg yt-dlp       # macOS
 # Single video
 uv run obolha https://youtu.be/XYZ
 
+# Use Antigravity / Gemini provider explicitly
+uv run obolha --provider gemini https://youtu.be/XYZ
+
 # Multiple videos in parallel
 uv run obolha https://youtu.be/ABC https://youtu.be/DEF
 
@@ -41,7 +46,8 @@ uv run obolha --interactive
 
 # Full options
 uv run obolha https://youtu.be/XYZ \
-  --clips 8         \  # max clips per video   (default: 5)
+  --provider gemini \  # groq | gemini | antigravity | auto
+  --clips 8         \  # max clips per video   (default: 20)
   --min 60          \  # min clip seconds       (default: 30)
   --max 240         \  # max clip seconds       (default: 180)
   --output /tmp/clips  \  # output folder
@@ -60,6 +66,7 @@ from obolha import clip_videos
 
 clips = clip_videos(
     ["https://youtu.be/XYZ"],
+    provider="gemini",  # or "groq" / "auto"
     max_clips=3,
     min_duration=60,
     output_dir="/tmp/clips",
@@ -87,15 +94,32 @@ Raises `MissingDependencyError` or `MissingAPIKeyError` on missing setup — nev
 
 | Variable               | Default                    | Description                         |
 |------------------------|----------------------------|-------------------------------------|
-| `GROQ_API_KEY`         | (required)                 | Groq API key                        |
-| `CLIPPER_MODEL`        | llama-3.3-70b-versatile    | Groq model for analysis             |
+| `GROQ_API_KEY`         | (optional)                 | Groq API key                        |
+| `GEMINI_API_KEY`       | (optional)                 | Google GenAI / Gemini API key       |
+| `ANTIGRAVITY_API_KEY`  | (optional)                 | Antigravity SDK key                 |
+| `CLIPPER_PROVIDER`     | auto                       | LLM provider: `auto`, `groq`, `gemini`, `antigravity` |
+| `CLIPPER_MODEL`        | (auto by provider)         | `llama-3.3-70b-versatile` (groq) or `gemini-2.5-flash` (gemini) |
 | `CLIPPER_LANG`         | pt                         | Transcription language              |
-| `CLIPPER_MAX_CLIPS`    | 5                          | Max clips per video                 |
-| `CLIPPER_MIN_DURATION` | 30                         | Min clip duration (seconds)         |
-| `CLIPPER_MAX_DURATION` | 180                        | Max clip duration (seconds)         |
+| `CLIPPER_MAX_CLIPS`    | 20                         | Max clips per video                 |
+| `CLIPPER_MIN_DURATION` | 20                         | Min clip duration (seconds)         |
+| `CLIPPER_MAX_DURATION` | 60                         | Max clip duration (seconds)         |
 | `CLIPPER_OUTPUT_DIR`   | ./clips                    | Output folder                       |
 | `CLIPPER_WORKERS`      | 3                          | Parallel workers                    |
 | `CLIPPER_WHISPER_MODEL`| base                       | tiny / base / small / medium / large|
+| `YOUTUBE_CLIENT_ID`    | —                          | OAuth para agendar uploads (web UI) |
+| `YOUTUBE_CLIENT_SECRET`| —                          | OAuth secret                        |
+| `YOUTUBE_REDIRECT_URI` | `http://127.0.0.1:8765/api/youtube/callback` | Callback OAuth |
+| `CLIPPER_DATA_DIR`     | `./data`                   | Tokens OAuth + fila de agendamentos |
+
+## Web UI + YouTube schedule
+
+```bash
+uv sync --extra web
+uv run obolha web
+# → http://127.0.0.1:8765 — aba YouTube para conectar conta e agendar reacts
+```
+
+Setup Google Cloud: projeto → **YouTube Data API v3** habilitada → credenciais OAuth (tipo “Desktop” ou “Web”) → redirect URI igual ao `YOUTUBE_REDIRECT_URI`. O upload usa `publishAt` (vídeo privado até o horário).
 
 ## Output
 
