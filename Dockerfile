@@ -18,4 +18,4 @@ ENV PYTHONUNBUFFERED=1 \
     CLIPPER_REACTS_SOURCE_DIR=/data/reacts_pool \
     CLIPPER_DATA_DIR=/data/data
 
-CMD ["uv", "run", "--frozen", "obolha", "watch"]
+CMD ["/app/.venv/bin/obolha", "watch"]

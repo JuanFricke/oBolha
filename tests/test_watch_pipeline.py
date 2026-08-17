@@ -79,6 +79,18 @@ def test_run_latest_short_react_requires_react_pool(tmp_path):
         run_latest_short_react("@renansantosmbl")
 
 
+def test_watch_cli_retries_when_react_pool_empty(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["obolha", "--interval", "30"])
+    with (
+        patch("obolha.check_download_deps"),
+        patch("obolha.run_watch_once", side_effect=FileNotFoundError("No react videos")),
+        patch("obolha.time.sleep", side_effect=KeyboardInterrupt),
+    ):
+        with pytest.raises(KeyboardInterrupt):
+            from obolha import run_watch_cli
+            run_watch_cli()
+
+
 def _react_result(tmp_path: Path) -> dict:
     video = tmp_path / "react.mp4"
     video.write_bytes(b"vid")

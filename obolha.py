@@ -2100,9 +2100,9 @@ def parse_watch_args():
 
 def run_watch_cli():
     args = parse_watch_args()
-    try:
-        check_download_deps(raise_on_error=True)
-        while True:
+    check_download_deps(raise_on_error=True)
+    while True:
+        try:
             result = run_watch_once(args.channel)
             if result.get("skipped"):
                 print(f"skip {result.get('id')}")
@@ -2113,12 +2113,13 @@ def run_watch_cli():
                     f"gerado (postiz falhou): {result.get('file')} "
                     f"({result.get('postiz_error')})"
                 )
+        except (FileNotFoundError, RuntimeError, ValueError) as e:
+            print(f"[ERRO] {e}")
             if args.once:
-                return
-            time.sleep(max(30, args.interval))
-    except (FileNotFoundError, MissingDependencyError, RuntimeError, ValueError) as e:
-        print(f"[ERRO] {e}")
-        sys.exit(1)
+                sys.exit(1)
+        if args.once:
+            return
+        time.sleep(max(30, args.interval))
 
 
 def parse_web_args():
