@@ -5,8 +5,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from obolha import (
+    fetch_latest_channel_short,
     fetch_top_channel_shorts,
+    is_short_processed,
     list_channel_shorts,
+    mark_short_processed,
     normalize_channel_shorts_url,
 )
 
@@ -104,3 +107,79 @@ def test_download_shorts_cmd_uses_force_overwrites(tmp_path):
     assert captured
     assert "--force-overwrites" in captured[0]
     assert "-y" not in captured[0]
+
+
+def test_list_channel_shorts_sort_latest_keeps_playlist_order():
+    payload = {
+        "title": "Renan",
+        "entries": [
+            {
+                "id": "new",
+                "title": "Novo",
+                "view_count": 10,
+                "duration": 20,
+                "timestamp": 1700000000,
+                "upload_date": "20260117",
+            },
+            {
+                "id": "old",
+                "title": "Velho",
+                "view_count": 999999,
+                "duration": 30,
+                "timestamp": 1600000000,
+                "upload_date": "20200101",
+            },
+        ],
+    }
+    mock_run = MagicMock()
+    mock_run.return_value.returncode = 0
+    mock_run.return_value.stdout = json.dumps(payload)
+    mock_run.return_value.stderr = ""
+
+    with patch("subprocess.run", mock_run):
+        channel, shorts = list_channel_shorts("@renansantosmbl", scan_limit=5, sort="latest")
+
+    assert channel == "Renan"
+    assert [s["id"] for s in shorts] == ["new", "old"]
+    assert shorts[0]["timestamp"] == 1700000000
+    assert shorts[0]["upload_date"] == "20260117"
+
+
+def test_fetch_latest_channel_short_downloads_first_playlist_item(tmp_path):
+    payload = {
+        "title": "Renan",
+        "entries": [
+            {"id": "abc", "title": "Latest", "view_count": 1, "duration": 15},
+            {"id": "zzz", "title": "Older viral", "view_count": 9_000_000, "duration": 15},
+        ],
+    }
+    list_proc = MagicMock()
+    list_proc.returncode = 0
+    list_proc.stdout = json.dumps(payload)
+    list_proc.stderr = ""
+
+    dl_proc = MagicMock()
+    dl_proc.returncode = 0
+    dl_proc.stderr = ""
+
+    def fake_run(cmd, **kwargs):
+        if "-J" in cmd:
+            return list_proc
+        for i, arg in enumerate(cmd):
+            if arg == "-o" and i + 1 < len(cmd):
+                Path(cmd[i + 1]).write_bytes(b"fake")
+        return dl_proc
+
+    with patch("subprocess.run", fake_run):
+        result = fetch_latest_channel_short("@renansantosmbl", output_dir=tmp_path / "out")
+
+    assert result["id"] == "abc"
+    assert Path(result["file"]).exists()
+
+
+def test_short_processed_dedup(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLIPPER_DATA_DIR", str(tmp_path))
+    assert is_short_processed("abc") is False
+    mark_short_processed("abc")
+    assert is_short_processed("abc") is True
+    assert is_short_processed("other") is False

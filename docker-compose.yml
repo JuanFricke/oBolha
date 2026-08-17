@@ -1,0 +1,28 @@
+services:
+  obolha:
+    image: ghcr.io/juanfricke/obolha:latest
+    restart: unless-stopped
+    environment:
+      CLIPPER_SHORTS_CHANNEL: ${CLIPPER_SHORTS_CHANNEL:-@renansantosmbl}
+      CLIPPER_POLL_SECONDS: ${CLIPPER_POLL_SECONDS:-900}
+      CLIPPER_CLIPS_DIR: /data/clips
+      CLIPPER_REACTS_DIR: /data/reacts
+      CLIPPER_REACTS_SOURCE_DIR: /data/reacts_pool
+      CLIPPER_DATA_DIR: /data/data
+      CLIPPER_PROVIDER: ${CLIPPER_PROVIDER:-anthropic}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      POSTIZ_BASE_URL: ${POSTIZ_BASE_URL:-https://postiz-x4rk.srv700899.hstgr.cloud/api/public/v1}
+      POSTIZ_API_KEY: ${POSTIZ_API_KEY:-}
+      POSTIZ_PLATFORMS: ${POSTIZ_PLATFORMS:-youtube,tiktok,instagram,facebook}
+    volumes:
+      - clips:/data/clips
+      - reacts:/data/reacts
+      - reacts_pool:/data/reacts_pool
+      - data:/data/data
+
+volumes:
+  clips:
+  reacts:
+  reacts_pool:
+  data:

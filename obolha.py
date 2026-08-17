@@ -10,6 +10,7 @@ CLI usage:
   python obolha.py facecam <clip.mp4> <facecam.mp4> [-o output.mp4]
   python obolha.py shorts @Canal --top 10
   python obolha.py auto-react [--force]
+  python obolha.py watch [--channel @handle] [--once]
   python obolha.py web [--host 127.0.0.1] [--port 8765]
 
 Python API (for AI agents / scripts):
@@ -56,6 +57,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Optional
 from queue import Queue
+
+from postiz import PostizClient
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Imports opcionais — avisa claramente se faltarem
@@ -518,13 +521,18 @@ def channel_slug_from_url(url: str) -> str:
     return safe_filename(url)
 
 
-def list_channel_shorts(channel_url: str, scan_limit: int = 100) -> tuple[str, list[dict]]:
+def list_channel_shorts(
+    channel_url: str,
+    scan_limit: int = 100,
+    sort: str = "views",
+) -> tuple[str, list[dict]]:
     """
-    List shorts from a channel's /shorts tab, sorted by view_count (desc).
-    Scans up to scan_limit entries via yt-dlp metadata (no download).
+    List shorts from a channel's /shorts tab.
+    sort=views ranks by view_count (desc). sort=latest keeps playlist order
+    (YouTube /shorts tab is newest first).
     """
     url = normalize_channel_shorts_url(channel_url)
-    log(f"Listando shorts: {url} (scan={scan_limit})")
+    log(f"Listando shorts: {url} (scan={scan_limit}, sort={sort})")
 
     result = subprocess.run(
         [
@@ -556,9 +564,13 @@ def list_channel_shorts(channel_url: str, scan_limit: int = 100) -> tuple[str, l
             "view_count": int(entry.get("view_count") or 0),
             "duration": float(entry.get("duration") or 0),
             "url": entry.get("webpage_url") or f"https://youtu.be/{vid}",
+            "timestamp": entry.get("timestamp"),
+            "upload_date": entry.get("upload_date"),
+            "description": entry.get("description") or "",
         })
 
-    shorts.sort(key=lambda s: s["view_count"], reverse=True)
+    if sort == "views":
+        shorts.sort(key=lambda s: s["view_count"], reverse=True)
     log(f"Shorts encontrados: {len(shorts)} em {channel_title}")
     return channel_title, shorts
 
@@ -648,6 +660,64 @@ def fetch_top_channel_shorts(
     (out / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2))
     log(f"✓ {len(results)} shorts em {out}", "ok")
     return results
+
+
+def fetch_latest_channel_short(
+    channel_url: str,
+    output_dir: str | Path | None = None,
+) -> dict:
+    """Download the newest short from a channel's /shorts tab."""
+    channel_title, all_shorts = list_channel_shorts(
+        channel_url, scan_limit=5, sort="latest"
+    )
+    if not all_shorts:
+        raise RuntimeError("Nenhum short encontrado no canal")
+
+    latest = all_shorts[0]
+    if output_dir is None:
+        slug = safe_filename(channel_title) or channel_slug_from_url(
+            normalize_channel_shorts_url(channel_url)
+        )
+        output_dir = get_clips_dir() / "shorts" / slug
+    out = Path(output_dir)
+    results = download_shorts([latest], out)
+    if not results:
+        raise RuntimeError(f"Falha ao baixar o short mais recente: {latest.get('url')}")
+    return results[0]
+
+
+def _processed_shorts_path() -> Path:
+    root = Path(os.getenv("CLIPPER_DATA_DIR", "./data"))
+    root.mkdir(parents=True, exist_ok=True)
+    return root / "processed_shorts.json"
+
+
+def _load_processed_ids() -> list[str]:
+    path = _processed_shorts_path()
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text())
+    except json.JSONDecodeError:
+        return []
+    if isinstance(data, dict):
+        return [str(i) for i in data.get("ids", [])]
+    if isinstance(data, list):
+        return [str(i) for i in data]
+    return []
+
+
+def is_short_processed(video_id: str) -> bool:
+    return video_id in _load_processed_ids()
+
+
+def mark_short_processed(video_id: str) -> None:
+    ids = _load_processed_ids()
+    if video_id not in ids:
+        ids.append(video_id)
+    _processed_shorts_path().write_text(
+        json.dumps({"ids": ids}, ensure_ascii=False, indent=2)
+    )
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Etapa 2: Transcrição
@@ -1510,6 +1580,196 @@ def auto_compose_reacts(
     log(f"Auto-react done: {len(results)} vídeo(s) em {get_reacts_dir()}", "ok")
     return results
 
+
+def run_latest_short_react(channel: str) -> dict:
+    """Download the newest channel short and compose a fake-react. No Whisper."""
+    sources = list_react_sources()
+    if not sources:
+        raise FileNotFoundError(
+            f"No react videos in {get_reacts_source_dir()}. "
+            "Set CLIPPER_REACTS_SOURCE_DIR to a folder of facecam mp4s."
+        )
+
+    _, shorts = list_channel_shorts(channel, scan_limit=5, sort="latest")
+    if not shorts:
+        raise RuntimeError("Nenhum short encontrado no canal")
+    latest = shorts[0]
+    if is_short_processed(latest["id"]):
+        log(f"Skip (já processado): {latest['id']}", "info")
+        return {**latest, "skipped": True}
+
+    short = fetch_latest_channel_short(channel)
+    clip_path = Path(short["file"])
+    react_path = random.choice(sources)
+    out_path = react_output_path_for_clip(clip_path)
+    out = compose_facecam(clip_path, react_path, out_path)
+    return {
+        **short,
+        "clip": str(clip_path),
+        "react": str(react_path),
+        "file": str(out),
+        "skipped": False,
+    }
+
+
+OUTSIDE_BUBBLE_SYSTEM = """Você escreve copy de Shorts/Reels/TikTok em português do Brasil para um público que NÃO segue MBL, MISSÃO nem o canal de origem.
+
+Objetivo: o post precisa fazer sentido sozinho para alguém que acabou de cair no vídeo pelo algoritmo.
+
+Regras:
+- Explique o fato em linguagem cotidiana. Sem jargão de bolha, sem convocar "a missão", sem assumir que o espectador conhece o Renan Santos.
+- NÃO use as hashtags #mbl, #missão, #missao, #renan, #renansantos.
+- Prefira hashtags de descoberta: #brasil #noticias #shorts #politica (e similares genéricos).
+- A primeira frase da caption é o hook (primeiros 2 segundos de leitura).
+- Cite a fonte no texto (ex.: "no canal de Renan Santos") por honestidade/fair use.
+- Não invente fatos que não estejam no título, descrição ou legendas.
+
+Responda APENAS JSON válido, sem markdown:
+{"titulo":"...até 90 caracteres","caption":"...","hashtags":["#brasil","#noticias"]}
+"""
+
+_BUBBLE_HASHTAGS = {"#mbl", "#missão", "#missao", "#renan", "#renansantos"}
+
+
+def parse_outside_bubble_copy(raw: str) -> dict:
+    """Parse LLM JSON and strip in-group hashtags."""
+    data = {}
+    json_match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if json_match:
+        try:
+            parsed = json.loads(json_match.group())
+            if isinstance(parsed, dict):
+                data = parsed
+        except json.JSONDecodeError:
+            data = {}
+    titulo = str(data.get("titulo") or "").strip()
+    caption = str(data.get("caption") or "").strip()
+    raw_tags = data.get("hashtags") or []
+    hashtags = []
+    for tag in raw_tags:
+        tag = str(tag).strip()
+        if not tag:
+            continue
+        if not tag.startswith("#"):
+            tag = f"#{tag}"
+        if tag.lower() in _BUBBLE_HASHTAGS:
+            continue
+        hashtags.append(tag)
+    if not titulo:
+        raise ValueError("LLM copy sem titulo")
+    if not caption:
+        raise ValueError("LLM copy sem caption")
+    return {"titulo": titulo[:90], "caption": caption, "hashtags": hashtags}
+
+
+def llm_complete(system: str, user: str, *, max_tokens: int = 800) -> str:
+    """One-shot LLM completion using the configured provider."""
+    active_prov = CFG.get("active_provider") or CFG.get("provider", "anthropic")
+    if active_prov == "auto":
+        if CFG.get("anthropic_api_key"):
+            active_prov = "anthropic"
+        elif CFG.get("groq_api_key"):
+            active_prov = "groq"
+        else:
+            active_prov = "gemini"
+
+    if active_prov in ("gemini", "antigravity"):
+        if not HAS_GENAI or genai is None:
+            raise MissingDependencyError("google-genai package is required")
+        client = genai.Client(api_key=CFG.get("gemini_api_key") or CFG.get("antigravity_api_key") or None)
+        response = client.models.generate_content(
+            model=CFG["model"] or "gemini-2.5-flash",
+            contents=user,
+            config={
+                "system_instruction": system,
+                "temperature": 0.4,
+                "max_output_tokens": max_tokens,
+            },
+        )
+        return (response.text or "").strip()
+
+    if active_prov == "anthropic":
+        if not HAS_ANTHROPIC or anthropic_lib is None:
+            raise MissingDependencyError("anthropic package is required")
+        client = anthropic_lib.Anthropic(api_key=CFG["anthropic_api_key"])
+        response = client.messages.create(
+            model=ANTHROPIC_HAIKU_MODEL,
+            max_tokens=max_tokens,
+            temperature=0.4,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+        return (response.content[0].text or "").strip()
+
+    if not HAS_GROQ:
+        raise MissingDependencyError("groq package is required")
+    client = groq_lib.Groq(api_key=CFG["groq_api_key"])
+    response = client.chat.completions.create(
+        model=CFG["model"] or "llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        temperature=0.4,
+        max_tokens=max_tokens,
+    )
+    return (response.choices[0].message.content or "").strip()
+
+
+def generate_outside_bubble_copy(
+    *,
+    title: str,
+    description: str = "",
+    captions: str = "",
+) -> dict:
+    user = (
+        f"titulo: {title}\n"
+        f"descricao: {description or '(vazia)'}\n"
+        f"legendas: {captions or '(indisponivel)'}\n"
+    )
+    raw = llm_complete(OUTSIDE_BUBBLE_SYSTEM, user)
+    return parse_outside_bubble_copy(raw)
+
+
+def run_watch_once(channel: str) -> dict:
+    """One cycle: react the latest short and try to publish via Postiz."""
+    result = run_latest_short_react(channel)
+    if result.get("skipped"):
+        return result
+
+    copy = generate_outside_bubble_copy(
+        title=result.get("title") or "",
+        description=result.get("description") or "",
+        captions=result.get("captions") or "",
+    )
+    result["copy"] = copy
+
+    base = (os.getenv("POSTIZ_BASE_URL") or "").rstrip("/")
+    key = os.getenv("POSTIZ_API_KEY") or ""
+    if not base or not key:
+        result["posted"] = False
+        result["postiz_error"] = "POSTIZ_BASE_URL / POSTIZ_API_KEY não definidos"
+        log(f"{result['postiz_error']} — vídeo em {result.get('file')}", "err")
+        return result
+
+    platforms = [
+        p.strip()
+        for p in os.getenv("POSTIZ_PLATFORMS", "youtube,tiktok,instagram,facebook").split(",")
+        if p.strip()
+    ]
+    try:
+        PostizClient(base, key).publish_video(
+            Path(result["file"]), copy, platforms=platforms
+        )
+        mark_short_processed(result["id"])
+        result["posted"] = True
+        log(f"✓ Postiz now: {result['id']}", "ok")
+    except Exception as e:
+        log(f"Postiz falhou, vídeo em disco: {result.get('file')}: {e}", "err")
+        result["posted"] = False
+        result["postiz_error"] = str(e)
+    return result
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Pipeline completo para um vídeo
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1819,6 +2079,48 @@ def run_auto_react_cli():
         sys.exit(1)
 
 
+def parse_watch_args():
+    p = argparse.ArgumentParser(
+        description="Watch a channel's latest short, fake-react, and post via Postiz",
+    )
+    p.add_argument(
+        "--channel",
+        default=os.getenv("CLIPPER_SHORTS_CHANNEL", "@renansantosmbl"),
+        help="YouTube @handle (default: @renansantosmbl)",
+    )
+    p.add_argument(
+        "--interval",
+        type=int,
+        default=int(os.getenv("CLIPPER_POLL_SECONDS", "900")),
+        help="Seconds between polls (default: 900)",
+    )
+    p.add_argument("--once", action="store_true", help="Run a single cycle and exit")
+    return p.parse_args()
+
+
+def run_watch_cli():
+    args = parse_watch_args()
+    try:
+        check_download_deps(raise_on_error=True)
+        while True:
+            result = run_watch_once(args.channel)
+            if result.get("skipped"):
+                print(f"skip {result.get('id')}")
+            elif result.get("posted"):
+                print(f"posted {result.get('id')} → {result.get('file')}")
+            else:
+                print(
+                    f"gerado (postiz falhou): {result.get('file')} "
+                    f"({result.get('postiz_error')})"
+                )
+            if args.once:
+                return
+            time.sleep(max(30, args.interval))
+    except (FileNotFoundError, MissingDependencyError, RuntimeError, ValueError) as e:
+        print(f"[ERRO] {e}")
+        sys.exit(1)
+
+
 def parse_web_args():
     p = argparse.ArgumentParser(description="oBolha web UI")
     p.add_argument("--host", default="127.0.0.1")
@@ -1944,6 +2246,11 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "web":
         sys.argv.pop(1)
         run_web_cli()
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1] == "watch":
+        sys.argv.pop(1)
+        run_watch_cli()
         return
 
     args = parse_args()

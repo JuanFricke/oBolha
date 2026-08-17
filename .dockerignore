@@ -1,0 +1,17 @@
+.venv
+.git
+.gitignore
+.pytest_cache
+.ruff_cache
+.mypy_cache
+__pycache__
+*.pyc
+.env
+.api
+clips
+reacts
+reacts_pool
+data
+tests
+*.mp4
+.cursor
