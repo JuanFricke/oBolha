@@ -10,9 +10,11 @@ WORKDIR /app
 COPY pyproject.toml uv.lock README.md ./
 COPY obolha.py webui.py youtube_schedule.py postiz.py ./
 
-RUN uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev \
+    && ln -sf /app/.venv/bin/yt-dlp /usr/local/bin/yt-dlp
 
 ENV PYTHONUNBUFFERED=1 \
+    PATH="/app/.venv/bin:${PATH}" \
     CLIPPER_CLIPS_DIR=/data/clips \
     CLIPPER_REACTS_DIR=/data/reacts \
     CLIPPER_REACTS_SOURCE_DIR=/data/reacts_pool \
