@@ -140,6 +140,22 @@ def test_watch_once_posts_and_marks_processed(tmp_path, monkeypatch):
     assert result["copy"] == copy
 
 
+def test_watch_once_posts_as_draft_when_env_set(tmp_path, monkeypatch):
+    monkeypatch.setenv("POSTIZ_BASE_URL", "https://postiz.example/api/public/v1")
+    monkeypatch.setenv("POSTIZ_API_KEY", "k")
+    monkeypatch.setenv("POSTIZ_POST_TYPE", "draft")
+    copy = {"titulo": "T", "caption": "C", "hashtags": []}
+    with (
+        patch("obolha.run_latest_short_react", return_value=_react_result(tmp_path)),
+        patch("obolha.generate_outside_bubble_copy", return_value=copy),
+        patch("obolha.PostizClient") as mock_cls,
+        patch("obolha.mark_short_processed"),
+    ):
+        mock_cls.return_value.publish_video.return_value = {"posted": True}
+        run_watch_once("@renansantosmbl")
+    assert mock_cls.return_value.publish_video.call_args.kwargs.get("post_type") == "draft"
+
+
 def test_watch_once_keeps_video_if_postiz_fails(tmp_path, monkeypatch):
     monkeypatch.setenv("POSTIZ_BASE_URL", "https://postiz.example/api/public/v1")
     monkeypatch.setenv("POSTIZ_API_KEY", "k")

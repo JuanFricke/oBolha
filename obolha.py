@@ -2289,10 +2289,11 @@ def run_watch_once(channel: str) -> dict:
         for p in os.getenv("POSTIZ_PLATFORMS", "youtube,tiktok,instagram,facebook").split(",")
         if p.strip()
     ]
+    post_type = os.getenv("POSTIZ_POST_TYPE", "now").strip() or "now"
     update_video_stage(video_id, postiz_publish_attempted=True, postiz_publish_ambiguous=False)
     try:
         PostizClient(base, key).publish_video(
-            Path(result["file"]), copy, platforms=platforms
+            Path(result["file"]), copy, platforms=platforms, post_type=post_type
         )
         update_video_stage(
             video_id,
@@ -2301,7 +2302,7 @@ def run_watch_once(channel: str) -> dict:
         )
         mark_short_processed(video_id)
         result["posted"] = True
-        log(f"✓ Postiz now: {video_id}", "ok")
+        log(f"✓ Postiz {post_type}: {video_id}", "ok")
     except PostizAmbiguousPublishError as e:
         update_video_stage(
             video_id,

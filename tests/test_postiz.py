@@ -54,6 +54,14 @@ def test_build_now_payload_one_post_per_integration():
     assert payload["posts"][1]["settings"]["__type"] == "tiktok"
 
 
+def test_build_now_payload_supports_draft_type():
+    copy = {"titulo": "T", "caption": "C"}
+    media = {"id": "m1", "path": "https://x/v.mp4"}
+    integrations = [{"id": "yt1", "identifier": "youtube"}]
+    payload = build_now_payload(integrations, media, copy, post_type="draft")
+    assert payload["type"] == "draft"
+
+
 def test_upload_and_create_now_posts(tmp_path):
     video = tmp_path / "react.mp4"
     video.write_bytes(b"mp4")

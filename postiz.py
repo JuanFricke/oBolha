@@ -119,6 +119,7 @@ def build_now_payload(
     integrations: list[dict],
     media: dict,
     copy: dict,
+    post_type: str = "now",
 ) -> dict:
     caption = str(copy.get("caption") or copy.get("titulo") or "")
     image = [{"id": media["id"], "path": media["path"]}]
@@ -131,7 +132,7 @@ def build_now_payload(
             "settings": settings_for(ident, copy),
         })
     return {
-        "type": "now",
+        "type": post_type,
         "date": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "shortLink": False,
         "tags": [],
@@ -152,6 +153,7 @@ class PostizClient:
         video: Path,
         copy: dict,
         platforms: list[str] | None = None,
+        post_type: str = "now",
     ) -> dict:
         platforms = platforms or list(DEFAULT_PLATFORMS)
         video = Path(video)
@@ -183,7 +185,7 @@ class PostizClient:
             upload_resp.raise_for_status()
             media = upload_resp.json()
 
-            payload = build_now_payload(targets, media, copy)
+            payload = build_now_payload(targets, media, copy, post_type=post_type)
             try:
                 create_resp = client.post(
                     f"{self.base_url}/posts",
