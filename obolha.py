@@ -42,23 +42,26 @@ try:
     load_dotenv()
 except ImportError:
     pass  # python-dotenv optional; set env vars manually if not installed
+import hashlib
 import re
 import sys
 import json
 import time
 import shutil
+import tempfile
 import random
 import argparse
 import subprocess
 import threading
+from contextlib import contextmanager
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Optional
 from queue import Queue
 
-from postiz import PostizClient
+from postiz import PostizClient, PostizAmbiguousPublishError, PostizPublishError
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Imports opcionais — avisa claramente se faltarem
@@ -232,7 +235,9 @@ _log_queue: Queue = Queue()
 def log(msg: str, level: str = "info"):
     ts = datetime.now().strftime("%H:%M:%S")
     prefix = {"info": "●", "ok": "✓", "warn": "!", "err": "✗"}.get(level, "●")
-    _log_queue.put(f"[{ts}] {prefix} {msg}")
+    line = f"[{ts}] {prefix} {msg}"
+    _log_queue.put(line)
+    print(line, file=sys.stderr, flush=True)
 
 def add_job(url: str) -> JobStatus:
     job = JobStatus(url=url)
@@ -410,12 +415,14 @@ def check_deps(raise_on_error: bool = False):
 
 
 def check_download_deps(raise_on_error: bool = False):
-    """Verify yt-dlp + ffmpeg (no LLM keys required)."""
+    """Verify yt-dlp + ffmpeg + ffprobe (no LLM keys required)."""
     missing = []
     if not shutil.which("yt-dlp"):
         missing.append("yt-dlp  → pip install yt-dlp  (ou: sudo apt install yt-dlp)")
     if not shutil.which("ffmpeg"):
         missing.append("ffmpeg  → sudo apt install ffmpeg")
+    if not shutil.which("ffprobe"):
+        missing.append("ffprobe → sudo apt install ffmpeg")
     if missing:
         msg = "Missing dependencies:\n" + "\n".join(f"  • {m}" for m in missing)
         if raise_on_error:
@@ -446,7 +453,7 @@ def download_video(url: str, work_dir: Path, job: JobStatus) -> tuple[Path, str]
 
     # Pega título primeiro
     title_result = subprocess.run(
-        ["yt-dlp", "--get-title", "--no-playlist", url],
+        ["yt-dlp", *yt_dlp_youtube_args(), "--get-title", "--no-playlist", url],
         capture_output=True, text=True, timeout=30
     )
     title = title_result.stdout.strip() or url
@@ -459,6 +466,7 @@ def download_video(url: str, work_dir: Path, job: JobStatus) -> tuple[Path, str]
 
     subprocess.run([
         "yt-dlp",
+        *yt_dlp_youtube_args(),
         "--write-auto-sub", "--write-sub",
         "--sub-lang", f"{CFG['lang']},pt,pt-BR,en",
         "--sub-format", "vtt/srt/best",
@@ -475,6 +483,7 @@ def download_video(url: str, work_dir: Path, job: JobStatus) -> tuple[Path, str]
     video_path = work_dir / "video.mp4"
     dl_result = subprocess.run([
         "yt-dlp",
+        *yt_dlp_youtube_args(),
         "-f", "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720]/best",
         "--merge-output-format", "mp4",
         "--no-playlist",
@@ -521,6 +530,179 @@ def channel_slug_from_url(url: str) -> str:
     return safe_filename(url)
 
 
+def _cookie_source_path() -> Path:
+    explicit = os.getenv("CLIPPER_YOUTUBE_COOKIES")
+    return Path(explicit) if explicit else Path(os.getenv("CLIPPER_DATA_DIR", "./data")) / "cookies.txt"
+
+
+def _write_private_file(dest: Path, data: bytes) -> None:
+    """Atomically write ``data`` to ``dest`` as mode 0600 without following symlinks."""
+    tmp = dest.with_name(dest.name + ".tmp")
+    if tmp.is_symlink() or tmp.exists():
+        tmp.unlink()
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+    os.replace(tmp, dest)  # replaces even a pre-existing symlink entry with the real file
+
+
+def _seed_cookie_jar(source: Path, work: Path) -> None:
+    """Seed/refresh the writable work jar from ``source`` when it changed or is corrupt.
+
+    Keyed on the source content hash (not mtime) so an mtime-preserving upload
+    — ``docker cp``, ``scp -p``, ``rsync -a`` — still refreshes a dead session.
+    """
+    seed = work.with_name(work.name + ".seed")
+    src_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+    valid = work.is_file() and not work.is_symlink() and work.stat().st_size > 0
+    recorded = seed.read_text().strip() if seed.is_file() else ""
+    if valid and recorded == src_hash:
+        os.chmod(work, 0o600)
+        return
+    _write_private_file(work, source.read_bytes())
+    _write_private_file(seed, src_hash.encode())
+
+
+def yt_dlp_cookie_args() -> list[str]:
+    """Give yt-dlp a persistent, writable cookie jar so rotated cookies survive.
+
+    The source jar (CLIPPER_YOUTUBE_COOKIES or data/cookies.txt) may be immutable.
+    We keep a writable ``<source>.work`` copy beside it in the data volume and let
+    yt-dlp rewrite it as YouTube rotates the session; it survives process restarts.
+    If the data dir is not writable we fall back to an ephemeral private copy so a
+    read-only mount degrades gracefully instead of crashing the watch daemon.
+    """
+    source = _cookie_source_path()
+    if not source.is_file():
+        return []
+    work = source.with_name(source.name + ".work")
+    try:
+        _seed_cookie_jar(source, work)
+        return ["--cookies", str(work)]
+    except OSError as e:
+        log(f"jar de cookies não gravável ({e}); usando cópia efêmera", "warn")
+    try:
+        fd, tmp = tempfile.mkstemp(prefix="yt-dlp-cookies-", suffix=".txt")
+        os.close(fd)
+        shutil.copyfile(source, tmp)
+        os.chmod(tmp, 0o600)
+        return ["--cookies", tmp]
+    except OSError:
+        return ["--cookies", str(source)]
+
+
+def clear_yt_dlp_cookie_jar() -> None:
+    """No-op kept for test compatibility; the work jar is intentionally persistent."""
+    return None
+
+
+def yt_dlp_youtube_args() -> list[str]:
+    """Cookies plus a cookie-capable YouTube client (android_vr ignores cookies)."""
+    return [
+        *yt_dlp_cookie_args(),
+        "--extractor-args",
+        "youtube:player_client=tv,tv_downgraded",
+    ]
+
+
+def yt_dlp_video_format(max_height: int = 1080) -> str:
+    """Prefer H.264/AVC; fall back when unavailable."""
+    return (
+        f"bestvideo[vcodec^=avc1][height<={max_height}]+bestaudio[ext=m4a]/"
+        f"bestvideo[vcodec^=avc][height<={max_height}]+bestaudio/"
+        f"bv*[height<={max_height}]+ba/"
+        f"b[height<={max_height}]/"
+        f"b"
+    )
+
+
+def short_source_path(video_id: str, output_dir: Path) -> Path:
+    """Stable source artifact path keyed by YouTube video ID."""
+    return output_dir / f"{video_id}_source.mp4"
+
+
+def short_render_path(video_id: str, reacts_dir: Path) -> Path:
+    """Stable rendered facecam path keyed by YouTube video ID."""
+    return reacts_dir / f"{video_id}_facecam.mp4"
+
+
+def short_source_dl_path(video_id: str, output_dir: Path) -> Path:
+    """Temporary download path; promoted to short_source_path on success."""
+    return output_dir / f"{video_id}_source.dl.mp4"
+
+
+def fetch_video_metadata(url: str) -> dict:
+    """Fetch full yt-dlp metadata for one video (not flat playlist)."""
+    result = subprocess.run(
+        [
+            "yt-dlp",
+            *yt_dlp_youtube_args(),
+            "-j",
+            "--no-download",
+            "--no-playlist",
+            url,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if result.returncode != 0:
+        return {}
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def enrich_short_metadata(short: dict) -> dict:
+    """Fill description from a full metadata fetch when flat-playlist omitted it."""
+    if short.get("description"):
+        return short
+    url = short.get("url") or (f"https://youtu.be/{short['id']}" if short.get("id") else "")
+    if not url:
+        return short
+    meta = fetch_video_metadata(url)
+    desc = meta.get("description") or ""
+    if desc:
+        return {**short, "description": desc}
+    return short
+
+
+def _merge_info_json(entry: dict, output_dir: Path, video_id: str) -> dict:
+    for info_path in sorted(output_dir.glob(f"{video_id}*.info.json")):
+        try:
+            info = json.loads(info_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if info.get("description") and not entry.get("description"):
+            return {**entry, "description": info["description"]}
+    return entry
+
+
+def _clean_yt_dlp_artifacts(video_id: str, output_dir: Path, *, keep: Path | None = None) -> None:
+    keep_resolved = keep.resolve() if keep else None
+    patterns = (
+        f"{video_id}_source.dl.*",
+        f"{video_id}*.info.json",
+        f"{video_id}.f*",
+        f"{video_id}*.part",
+        f"{video_id}*.ytdl",
+    )
+    for pattern in patterns:
+        for path in output_dir.glob(pattern):
+            if keep_resolved:
+                try:
+                    if path.resolve() == keep_resolved:
+                        continue
+                except OSError:
+                    pass
+            if path.is_file():
+                path.unlink(missing_ok=True)
+
+
 def list_channel_shorts(
     channel_url: str,
     scan_limit: int = 100,
@@ -536,7 +718,10 @@ def list_channel_shorts(
 
     result = subprocess.run(
         [
-            "yt-dlp", "-J",
+            "yt-dlp",
+            *yt_dlp_youtube_args(),
+            "-J",
+            "--flat-playlist",
             "--playlist-end", str(scan_limit),
             url,
         ],
@@ -576,29 +761,34 @@ def list_channel_shorts(
 
 
 def download_shorts(entries: list[dict], output_dir: Path) -> list[dict]:
-    """Download short videos into output_dir."""
+    """Download short videos into output_dir (paths keyed by video ID)."""
     output_dir.mkdir(parents=True, exist_ok=True)
     results: list[dict] = []
 
-    for i, entry in enumerate(entries, 1):
-        title = safe_filename(entry["title"])
-        views = entry["view_count"]
-        out_path = output_dir / f"{i:02d}_{title}_{views}.mp4"
+    for entry in entries:
+        vid = entry["id"]
+        out_path = short_source_path(vid, output_dir)
 
-        if out_path.exists():
-            log(f"Skip (exists): {out_path.name}", "info")
+        if is_valid_media(out_path):
+            log(f"Skip (valid source): {out_path.name}", "info")
             results.append({**entry, "file": str(out_path), "skipped": True})
             continue
 
-        log(f"Baixando short {i}/{len(entries)}: {entry['title']} ({views:,} views)")
+        log(f"Baixando short: {entry['title']} ({entry.get('view_count', 0):,} views)")
+        tmp_dl = short_source_dl_path(vid, output_dir)
+        _clean_yt_dlp_artifacts(vid, output_dir, keep=out_path if is_valid_media(out_path) else None)
+        tmp_dl.unlink(missing_ok=True)
+
         dl = subprocess.run(
             [
                 "yt-dlp",
+                *yt_dlp_youtube_args(),
                 "--force-overwrites",
-                "-f", "bv*[height<=1080]+ba/b[height<=1080]/b",
+                "-f", yt_dlp_video_format(),
                 "--merge-output-format", "mp4",
+                "--write-info-json",
                 "--no-playlist",
-                "-o", str(out_path),
+                "-o", str(tmp_dl),
                 entry["url"],
             ],
             capture_output=True,
@@ -608,19 +798,20 @@ def download_shorts(entries: list[dict], output_dir: Path) -> list[dict]:
         if dl.returncode != 0:
             err = (dl.stderr or "")[-300:]
             log(f"Erro download {entry['url']}: {err}", "warn")
+            _clean_yt_dlp_artifacts(vid, output_dir, keep=out_path if is_valid_media(out_path) else None)
             continue
 
-        if not out_path.exists():
-            candidates = list(output_dir.glob(f"{i:02d}_{title}*.mp4"))
-            if candidates:
-                out_path = candidates[0]
-            else:
-                log(f"Arquivo não encontrado após download: {entry['title']}", "warn")
-                continue
+        if not is_valid_media(tmp_dl):
+            log(f"Arquivo inválido após download: {entry['title']}", "warn")
+            _clean_yt_dlp_artifacts(vid, output_dir, keep=out_path if is_valid_media(out_path) else None)
+            continue
 
+        os.replace(tmp_dl, out_path)
+        _clean_yt_dlp_artifacts(vid, output_dir, keep=out_path)
+        merged = _merge_info_json(entry, output_dir, vid)
         size_mb = out_path.stat().st_size / 1024 / 1024
         log(f"✓ {out_path.name} ({size_mb:.1f}MB)", "ok")
-        results.append({**entry, "file": str(out_path), "size_mb": size_mb})
+        results.append({**merged, "file": str(out_path), "size_mb": size_mb})
 
     return results
 
@@ -692,32 +883,185 @@ def _processed_shorts_path() -> Path:
     return root / "processed_shorts.json"
 
 
-def _load_processed_ids() -> list[str]:
-    path = _processed_shorts_path()
-    if not path.exists():
-        return []
+def _video_stages_path() -> Path:
+    root = Path(os.getenv("CLIPPER_DATA_DIR", "./data"))
+    root.mkdir(parents=True, exist_ok=True)
+    return root / "video_stages.json"
+
+
+def _fsync_dir(path: Path) -> None:
     try:
-        data = json.loads(path.read_text())
-    except json.JSONDecodeError:
-        return []
-    if isinstance(data, dict):
-        return [str(i) for i in data.get("ids", [])]
-    if isinstance(data, list):
-        return [str(i) for i in data]
-    return []
+        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except (OSError, AttributeError):
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def write_json_atomic(path: Path, data: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.stem}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        _fsync_dir(path.parent)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+@contextmanager
+def _file_lock(path: Path):
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
+    try:
+        try:
+            import fcntl
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        except (ImportError, AttributeError, OSError):
+            yield
+        else:
+            try:
+                yield
+            finally:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                except (AttributeError, OSError):
+                    pass
+    finally:
+        os.close(lock_fd)
+
+
+def _read_json(path: Path, default_factory):
+    if not path.exists():
+        return default_factory()
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return default_factory()
+
+
+def _processed_ledger_from_raw(raw: object) -> dict:
+    if isinstance(raw, list):
+        return {"ids": [str(i) for i in raw]}
+    if isinstance(raw, dict):
+        return {"ids": [str(i) for i in raw.get("ids", [])]}
+    return {"ids": []}
+
+
+def _update_processed_ledger(mutator) -> None:
+    path = _processed_shorts_path()
+    with _file_lock(path):
+        ledger = _processed_ledger_from_raw(_read_json(path, lambda: {"ids": []}))
+        mutator(ledger)
+        write_json_atomic(path, ledger)
+
+
+def json_rmw(path: Path, default_factory, mutator) -> object:
+    with _file_lock(path):
+        data = _read_json(path, default_factory)
+        if not isinstance(data, dict):
+            data = default_factory()
+        mutator(data)
+        write_json_atomic(path, data)
+        return data
+
+
+RETRY_BACKOFF_BASE_SEC = 60
+RETRY_BACKOFF_MAX_SEC = 3600
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def compute_retry_backoff_seconds(retry_count: int) -> int:
+    exp = max(0, int(retry_count) - 1)
+    return min(RETRY_BACKOFF_MAX_SEC, RETRY_BACKOFF_BASE_SEC * (2 ** exp))
+
+
+def is_backoff_active(stage: dict, now: datetime | None = None) -> bool:
+    next_at = stage.get("next_retry_at")
+    if not next_at:
+        return False
+    now = now or utc_now()
+    try:
+        target = datetime.fromisoformat(str(next_at).replace("Z", "+00:00"))
+        if target.tzinfo is None:
+            target = target.replace(tzinfo=timezone.utc)
+        return now < target
+    except (TypeError, ValueError):
+        return False
+
+
+def clear_postiz_ambiguous(video_id: str) -> None:
+    update_video_stage(
+        video_id,
+        postiz_publish_ambiguous=False,
+        postiz_publish_attempted=False,
+    )
+
+
+def load_video_stages() -> dict:
+    data = _read_json(_video_stages_path(), lambda: {"videos": {}})
+    if not isinstance(data, dict):
+        return {"videos": {}}
+    data.setdefault("videos", {})
+    return data
+
+
+def save_video_stages_atomic(data: dict) -> None:
+    write_json_atomic(_video_stages_path(), data)
+
+
+def get_video_stage(video_id: str) -> dict:
+    return dict(load_video_stages().get("videos", {}).get(video_id, {}))
+
+
+def update_video_stage(video_id: str, **fields) -> None:
+    def mutate(data: dict) -> None:
+        data.setdefault("videos", {})
+        stage = dict(data["videos"].get(video_id, {}))
+        stage.update(fields)
+        data["videos"][video_id] = stage
+
+    json_rmw(_video_stages_path(), lambda: {"videos": {}}, mutate)
+
+
+def _load_processed_ids() -> list[str]:
+    raw = _read_json(_processed_shorts_path(), lambda: {"ids": []})
+    return _processed_ledger_from_raw(raw)["ids"]
 
 
 def is_short_processed(video_id: str) -> bool:
+    if get_video_stage(video_id).get("posted"):
+        return True
     return video_id in _load_processed_ids()
 
 
 def mark_short_processed(video_id: str) -> None:
-    ids = _load_processed_ids()
-    if video_id not in ids:
-        ids.append(video_id)
-    _processed_shorts_path().write_text(
-        json.dumps({"ids": ids}, ensure_ascii=False, indent=2)
-    )
+    update_video_stage(video_id, posted=True)
+
+    def mutate(ledger: dict) -> None:
+        ids = ledger["ids"]
+        if video_id not in ids:
+            ids.append(video_id)
+
+    _update_processed_ledger(mutate)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Etapa 2: Transcrição
@@ -1313,9 +1657,11 @@ def cut_clips(
 # ──────────────────────────────────────────────────────────────────────────────
 # Facecam compose — 9:16 (TikTok / Shorts) layout
 # ──────────────────────────────────────────────────────────────────────────────
-VERTICAL_WIDTH = 1080
-VERTICAL_HEIGHT = 1920
+VERTICAL_WIDTH = 720
+VERTICAL_HEIGHT = 1280
+OUTPUT_FPS = 30
 FACECAM_HEIGHT_RATIO = 0.4  # top strip height as fraction of canvas
+MIN_VALID_MEDIA_BYTES = 1024
 
 # Prefer software encoders; skip vaapi (needs hw filters) unless nothing else works
 _VIDEO_ENCODER_CANDIDATES = [
@@ -1382,9 +1728,9 @@ def get_video_encoder() -> str:
 
 
 def video_encode_args(encoder: str) -> list[str]:
-    """ffmpeg video encoding flags for the chosen encoder."""
+    """ffmpeg video encoding flags for clip subtitle burn (unchanged by facecam pipeline)."""
     if encoder == "libx264":
-        return ["-c:v", encoder, "-preset", "fast", "-crf", "23"]
+        return ["-c:v", encoder, "-preset", "ultrafast", "-crf", "23"]
     if encoder == "libopenh264":
         return ["-c:v", encoder, "-b:v", "4M"]
     if encoder in ("h264_nvenc", "h264_amf"):
@@ -1392,6 +1738,25 @@ def video_encode_args(encoder: str) -> list[str]:
     if encoder == "mpeg4":
         return ["-c:v", encoder, "-q:v", "5"]
     return ["-c:v", encoder]
+
+
+def facecam_encode_args(encoder: str) -> list[str]:
+    """ffmpeg video encoding flags for 720p facecam/watch pipeline."""
+    base = ["-pix_fmt", "yuv420p", "-r", str(OUTPUT_FPS)]
+    if encoder == "libx264":
+        return ["-c:v", encoder, "-preset", "ultrafast", "-crf", "23", *base]
+    if encoder == "libopenh264":
+        return ["-c:v", encoder, "-b:v", "2M", *base]
+    if encoder in ("h264_nvenc", "h264_amf"):
+        return ["-c:v", encoder, "-preset", "fast", "-cq", "23", *base]
+    if encoder == "mpeg4":
+        return ["-c:v", encoder, "-q:v", "5", *base]
+    return ["-c:v", encoder, *base]
+
+
+def atomic_render_tmp_path(path: Path) -> Path:
+    """Temp render path that keeps .mp4 so ffmpeg infers the muxer."""
+    return path.with_name(f"{path.stem}.out.tmp{path.suffix}")
 
 
 def audio_encode_args() -> list[str]:
@@ -1418,6 +1783,8 @@ def facecam_layout() -> dict:
 
 def get_media_duration(path: Path) -> float:
     """Return media duration in seconds via ffprobe."""
+    if not shutil.which("ffprobe"):
+        raise MissingDependencyError("ffprobe is required to probe media duration")
     result = subprocess.run(
         [
             "ffprobe", "-v", "error",
@@ -1434,6 +1801,42 @@ def get_media_duration(path: Path) -> float:
     return float(result.stdout.strip())
 
 
+def is_valid_media(path: Path) -> bool:
+    """True when path looks like a complete media file (not partial/corrupt)."""
+    if not shutil.which("ffprobe"):
+        raise MissingDependencyError("ffprobe is required to validate media")
+    if not path.is_file():
+        return False
+    try:
+        if path.stat().st_size < MIN_VALID_MEDIA_BYTES:
+            return False
+        duration = get_media_duration(path)
+        return duration > 0
+    except subprocess.TimeoutExpired:
+        return False
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def resolve_facecam_path(video_id: str, sources: list[Path], stage: dict) -> Path:
+    """Use persisted facecam when still present; otherwise reselect deterministically."""
+    if stage.get("facecam_path"):
+        persisted = Path(stage["facecam_path"])
+        if persisted.is_file():
+            return persisted
+    return select_facecam_for_video(video_id, sources)
+
+
+def select_facecam_for_video(video_id: str, sources: list[Path]) -> Path:
+    """Pick a react facecam deterministically from video_id."""
+    ordered = sorted(sources, key=lambda p: p.name)
+    if not ordered:
+        raise FileNotFoundError("No react sources")
+    digest = hashlib.sha256(video_id.encode()).hexdigest()
+    idx = int(digest, 16) % len(ordered)
+    return ordered[idx]
+
+
 def build_facecam_ffmpeg_cmd(
     clip_path: Path,
     facecam_path: Path,
@@ -1441,7 +1844,7 @@ def build_facecam_ffmpeg_cmd(
     duration: float,
 ) -> list[str]:
     """
-  Build ffmpeg command for 9:16 output:
+  Build ffmpeg command for 9:16 output (720x1280 @ 30fps yuv420p):
   - facecam on top strip (full width)
   - clip below, starting at the pixel row after the facecam (no overlap)
   - both scaled/cropped to fill their region
@@ -1450,12 +1853,13 @@ def build_facecam_ffmpeg_cmd(
     w, h = layout["out_w"], layout["out_h"]
     fc_h = layout["facecam_h"]
     bottom_h = layout["bottom_h"]
+    fps = OUTPUT_FPS
 
     filter_complex = (
         f"[0:v]scale={w}:{bottom_h}:force_original_aspect_ratio=increase,"
-        f"crop={w}:{bottom_h},setpts=PTS-STARTPTS[main];"
+        f"crop={w}:{bottom_h},fps={fps},setpts=PTS-STARTPTS[main];"
         f"[1:v]scale={w}:{fc_h}:force_original_aspect_ratio=increase,"
-        f"crop={w}:{fc_h},setpts=PTS-STARTPTS[fc];"
+        f"crop={w}:{fc_h},fps={fps},setpts=PTS-STARTPTS[fc];"
         f"[fc][main]vstack=inputs=2[outv]"
     )
 
@@ -1469,7 +1873,7 @@ def build_facecam_ffmpeg_cmd(
         "-map", "[outv]",
         "-map", "0:a?",
         "-map", "-1:a",  # mute facecam — clip audio only
-        *video_encode_args(vencoder),
+        *facecam_encode_args(vencoder),
         *audio_encode_args(),
         "-t", f"{duration:.2f}",
         str(output_path),
@@ -1480,18 +1884,23 @@ def compose_facecam(
     clip_path: str | Path,
     facecam_path: str | Path,
     output_path: str | Path | None = None,
+    *,
+    skip_if_valid: bool = True,
 ) -> Path:
     """
     Compose a clip with a facecam overlay for 9:16 vertical output.
 
-    Layout (1080x1920):
+    Layout (720x1280 @ 30fps):
       - Top: facecam strip (40% height, full width)
       - Bottom: clip fills remaining height, starts below facecam (vstack, no overlap)
+
+    Writes to a temp file and atomically replaces the final path on success.
 
     Args:
         clip_path: Path to the source clip (from cut_clips).
         facecam_path: Path to the facecam video file.
         output_path: Optional output path; defaults to <clip>_facecam.mp4.
+        skip_if_valid: Reuse existing output when it passes is_valid_media.
 
     Returns:
         Path to the composed output file.
@@ -1516,14 +1925,31 @@ def compose_facecam(
     out = Path(output_path).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
 
+    if skip_if_valid and is_valid_media(out):
+        log(f"Skip (valid render): {out.name}", "info")
+        return out
+
     duration = get_media_duration(clip)
-    cmd = build_facecam_ffmpeg_cmd(clip, facecam, out, duration)
+    tmp_out = atomic_render_tmp_path(out)
+    tmp_out.unlink(missing_ok=True)
+    cmd = build_facecam_ffmpeg_cmd(clip, facecam, tmp_out, duration)
 
     log(f"Composing 9:16 facecam: {clip.name} + {facecam.name} (encoder: {get_video_encoder()})")
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    timeout = max(900, int(duration * 8) + 180)
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as e:
+        tmp_out.unlink(missing_ok=True)
+        raise RuntimeError(f"ffmpeg facecam compose timed out after {e.timeout}s") from e
     if result.returncode != 0:
+        tmp_out.unlink(missing_ok=True)
         raise RuntimeError(f"ffmpeg facecam compose failed: {result.stderr[-400:]}")
 
+    if not is_valid_media(tmp_out):
+        tmp_out.unlink(missing_ok=True)
+        raise RuntimeError("ffmpeg facecam compose produced invalid output")
+
+    os.replace(tmp_out, out)
     size_mb = out.stat().st_size / 1024 / 1024
     log(f"✓ Facecam compose: {out.name} ({duration:.1f}s, {size_mb:.1f}MB)", "ok")
     return out
@@ -1590,26 +2016,109 @@ def run_latest_short_react(channel: str) -> dict:
             "Set CLIPPER_REACTS_SOURCE_DIR to a folder of facecam mp4s."
         )
 
-    _, shorts = list_channel_shorts(channel, scan_limit=5, sort="latest")
+    channel_title, shorts = list_channel_shorts(channel, scan_limit=5, sort="latest")
     if not shorts:
         raise RuntimeError("Nenhum short encontrado no canal")
     latest = shorts[0]
-    if is_short_processed(latest["id"]):
-        log(f"Skip (já processado): {latest['id']}", "info")
+    video_id = latest["id"]
+    if is_short_processed(video_id):
+        log(f"Skip (já processado): {video_id}", "info")
         return {**latest, "skipped": True}
 
-    short = fetch_latest_channel_short(channel)
-    clip_path = Path(short["file"])
-    react_path = random.choice(sources)
-    out_path = react_output_path_for_clip(clip_path)
-    out = compose_facecam(clip_path, react_path, out_path)
-    return {
-        **short,
-        "clip": str(clip_path),
-        "react": str(react_path),
-        "file": str(out),
-        "skipped": False,
-    }
+    latest = enrich_short_metadata(latest)
+    shorts[0] = latest
+    video_id = latest["id"]
+
+    stage = get_video_stage(video_id)
+    if is_backoff_active(stage):
+        log(
+            f"Backoff ativo para {video_id} até {stage.get('next_retry_at')} "
+            f"(tentativa {stage.get('retry_count', 0)})",
+            "info",
+        )
+        return {
+            **latest,
+            "skipped": True,
+            "backoff": True,
+            "next_retry_at": stage.get("next_retry_at"),
+        }
+
+    slug = safe_filename(channel_title) or channel_slug_from_url(
+        normalize_channel_shorts_url(channel)
+    )
+    source_dir = get_clips_dir() / "shorts" / slug
+    render_dir = get_reacts_dir() / "shorts" / slug
+    source_dir.mkdir(parents=True, exist_ok=True)
+    render_dir.mkdir(parents=True, exist_ok=True)
+
+    source_path = Path(stage["source_path"]) if stage.get("source_path") else short_source_path(video_id, source_dir)
+    render_path = Path(stage["render_path"]) if stage.get("render_path") else short_render_path(video_id, render_dir)
+    facecam_path = resolve_facecam_path(video_id, sources, stage)
+
+    short = dict(latest)
+    retry_count = int(stage.get("retry_count") or 0)
+
+    try:
+        if is_valid_media(source_path):
+            log(f"Reusing source: {source_path.name}", "info")
+            short["file"] = str(source_path)
+            short["skipped"] = True
+        else:
+            source_path.unlink(missing_ok=True)
+            results = download_shorts([latest], source_dir)
+            if not results:
+                raise RuntimeError(f"Falha ao baixar o short mais recente: {latest.get('url')}")
+            short = {**results[0]}
+            source_path = Path(short["file"])
+            update_video_stage(
+                video_id,
+                downloaded=True,
+                source_path=str(source_path),
+                facecam_path=str(facecam_path),
+            )
+
+        if is_valid_media(render_path):
+            log(f"Reusing render: {render_path.name}", "info")
+            out = render_path
+        else:
+            render_path.unlink(missing_ok=True)
+            out = compose_facecam(source_path, facecam_path, render_path)
+            update_video_stage(
+                video_id,
+                rendered=True,
+                render_path=str(out),
+                facecam_path=str(facecam_path),
+                last_error="",
+                next_retry_at="",
+            )
+
+        update_video_stage(video_id, next_retry_at="", last_error="")
+        return {
+            **short,
+            "clip": str(source_path),
+            "react": str(facecam_path),
+            "file": str(out),
+            "skipped": False,
+        }
+    except Exception as e:
+        new_retry = retry_count + 1
+        backoff_sec = compute_retry_backoff_seconds(new_retry)
+        next_retry = (utc_now() + timedelta(seconds=backoff_sec)).isoformat()
+        fields = {
+            "retry_count": new_retry,
+            "next_retry_at": next_retry,
+            "last_error": str(e)[:500],
+            "source_path": str(source_path),
+            "render_path": str(render_path) if render_path else "",
+            "facecam_path": str(facecam_path),
+        }
+        try:
+            if is_valid_media(source_path):
+                fields["downloaded"] = True
+        except Exception:
+            pass
+        update_video_stage(video_id, **fields)
+        raise
 
 
 OUTSIDE_BUBBLE_SYSTEM = """Você escreve copy de Shorts/Reels/TikTok em português do Brasil para um público que NÃO segue MBL, MISSÃO nem o canal de origem.
@@ -1731,10 +2240,33 @@ def generate_outside_bubble_copy(
     return parse_outside_bubble_copy(raw)
 
 
+def _postiz_blocked_message(video_id: str) -> str:
+    return f"ambiguous prior Postiz publish; run: obolha watch clear-ambiguous {video_id}"
+
+
+def _postiz_publish_blocked(stage: dict) -> bool:
+    if stage.get("postiz_publish_ambiguous"):
+        return True
+    return bool(stage.get("postiz_publish_attempted") and not stage.get("posted"))
+
+
 def run_watch_once(channel: str) -> dict:
     """One cycle: react the latest short and try to publish via Postiz."""
     result = run_latest_short_react(channel)
     if result.get("skipped"):
+        return result
+
+    video_id = result["id"]
+    stage = get_video_stage(video_id)
+    if stage.get("postiz_publish_attempted") and not stage.get("posted") and not stage.get("postiz_publish_ambiguous"):
+        update_video_stage(video_id, postiz_publish_ambiguous=True)
+        stage = get_video_stage(video_id)
+
+    if _postiz_publish_blocked(stage):
+        msg = _postiz_blocked_message(video_id)
+        result["posted"] = False
+        result["postiz_error"] = msg
+        log(msg, "warn")
         return result
 
     copy = generate_outside_bubble_copy(
@@ -1757,14 +2289,42 @@ def run_watch_once(channel: str) -> dict:
         for p in os.getenv("POSTIZ_PLATFORMS", "youtube,tiktok,instagram,facebook").split(",")
         if p.strip()
     ]
+    update_video_stage(video_id, postiz_publish_attempted=True, postiz_publish_ambiguous=False)
     try:
         PostizClient(base, key).publish_video(
             Path(result["file"]), copy, platforms=platforms
         )
-        mark_short_processed(result["id"])
+        update_video_stage(
+            video_id,
+            postiz_publish_ambiguous=False,
+            postiz_publish_attempted=False,
+        )
+        mark_short_processed(video_id)
         result["posted"] = True
-        log(f"✓ Postiz now: {result['id']}", "ok")
+        log(f"✓ Postiz now: {video_id}", "ok")
+    except PostizAmbiguousPublishError as e:
+        update_video_stage(
+            video_id,
+            postiz_publish_ambiguous=True,
+            postiz_publish_attempted=True,
+            last_error=str(e)[:500],
+        )
+        msg = _postiz_blocked_message(video_id)
+        log(f"Postiz ambíguo, vídeo em disco: {result.get('file')}: {e}", "err")
+        result["posted"] = False
+        result["postiz_error"] = msg
+    except PostizPublishError as e:
+        update_video_stage(
+            video_id,
+            postiz_publish_attempted=False,
+            postiz_publish_ambiguous=False,
+            last_error=str(e)[:500],
+        )
+        log(f"Postiz falhou, vídeo em disco: {result.get('file')}: {e}", "err")
+        result["posted"] = False
+        result["postiz_error"] = str(e)
     except Exception as e:
+        update_video_stage(video_id, postiz_publish_attempted=False, last_error=str(e)[:500])
         log(f"Postiz falhou, vídeo em disco: {result.get('file')}: {e}", "err")
         result["posted"] = False
         result["postiz_error"] = str(e)
@@ -2105,16 +2665,17 @@ def run_watch_cli():
         try:
             result = run_watch_once(args.channel)
             if result.get("skipped"):
-                print(f"skip {result.get('id')}")
+                print(f"skip {result.get('id')}", flush=True)
             elif result.get("posted"):
-                print(f"posted {result.get('id')} → {result.get('file')}")
+                print(f"posted {result.get('id')} → {result.get('file')}", flush=True)
             else:
                 print(
                     f"gerado (postiz falhou): {result.get('file')} "
-                    f"({result.get('postiz_error')})"
+                    f"({result.get('postiz_error')})",
+                    flush=True,
                 )
-        except (FileNotFoundError, RuntimeError, ValueError) as e:
-            print(f"[ERRO] {e}")
+        except (FileNotFoundError, RuntimeError, ValueError, subprocess.TimeoutExpired) as e:
+            print(f"[ERRO] {e}", flush=True)
             if args.once:
                 sys.exit(1)
         if args.once:
@@ -2250,6 +2811,10 @@ def main():
         return
 
     if len(sys.argv) > 1 and sys.argv[1] == "watch":
+        if len(sys.argv) > 3 and sys.argv[2] == "clear-ambiguous":
+            clear_postiz_ambiguous(sys.argv[3])
+            print(f"✓ Postiz ambiguous flag cleared for {sys.argv[3]}")
+            return
         sys.argv.pop(1)
         run_watch_cli()
         return

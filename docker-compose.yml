@@ -1,6 +1,7 @@
 services:
   obolha:
     image: ghcr.io/juanfricke/obolha:latest
+    pull_policy: always
     restart: unless-stopped
     environment:
       CLIPPER_SHORTS_CHANNEL: ${CLIPPER_SHORTS_CHANNEL:-@renansantosmbl}
@@ -9,6 +10,8 @@ services:
       CLIPPER_REACTS_DIR: /data/reacts
       CLIPPER_REACTS_SOURCE_DIR: /data/reacts_pool
       CLIPPER_DATA_DIR: /data/data
+      CLIPPER_YOUTUBE_COOKIES: ${CLIPPER_YOUTUBE_COOKIES:-}
+      PATH: /app/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
       CLIPPER_PROVIDER: ${CLIPPER_PROVIDER:-anthropic}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       GROQ_API_KEY: ${GROQ_API_KEY:-}

@@ -46,6 +46,7 @@ def test_build_now_payload_one_post_per_integration():
     ]
     payload = build_now_payload(integrations, media, copy)
     assert payload["type"] == "now"
+    assert payload["date"].endswith("Z") or "+" in payload["date"]
     assert len(payload["posts"]) == 2
     assert payload["posts"][0]["value"][0]["content"] == "Caption #brasil"
     assert payload["posts"][0]["value"][0]["image"][0]["path"] == media["path"]
@@ -71,6 +72,7 @@ def test_upload_and_create_now_posts(tmp_path):
     ]
 
     create_resp = MagicMock()
+    create_resp.is_error = False
     create_resp.raise_for_status = MagicMock()
     create_resp.json.return_value = {"ok": True}
 

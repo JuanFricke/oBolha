@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +11,51 @@ import httpx
 DEFAULT_PLATFORMS = ["youtube", "tiktok", "instagram", "facebook"]
 
 _INSTAGRAM_IDS = {"instagram", "instagram-standalone"}
+
+
+class PostizPublishError(RuntimeError):
+    """Definite HTTP failure — safe to retry publish."""
+
+
+class PostizAmbiguousPublishError(RuntimeError):
+    """Transport/read timeout after create may have committed — do not auto-republish."""
+
+
+_AMBIGUOUS_TRANSPORT = (
+    httpx.ReadTimeout,
+    httpx.WriteTimeout,
+    httpx.RemoteProtocolError,
+    httpx.ReadError,
+    httpx.WriteError,
+)
+_DEFINITE_TRANSPORT = (
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+    httpx.ConnectError,
+)
+
+
+def classify_postiz_transport_error(exc: Exception) -> type[Exception]:
+    if isinstance(exc, _DEFINITE_TRANSPORT):
+        return PostizPublishError
+    if isinstance(exc, _AMBIGUOUS_TRANSPORT):
+        return PostizAmbiguousPublishError
+    return PostizPublishError
+
+
+def _reraise_postiz_transport(exc: Exception, *, phase: str) -> None:
+    kind = classify_postiz_transport_error(exc)
+    if kind is PostizAmbiguousPublishError:
+        raise PostizAmbiguousPublishError(f"Postiz {phase} ambiguous: {exc}") from exc
+    raise PostizPublishError(f"Postiz {phase} failed: {exc}") from exc
+
+
+def parse_response_json(resp: httpx.Response) -> dict:
+    try:
+        data = resp.json()
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
 def filter_target_integrations(
@@ -35,6 +81,8 @@ def filter_target_integrations(
 
 def settings_for(identifier: str, copy: dict) -> dict[str, Any]:
     title = str(copy.get("titulo") or "Short")[:90]
+    if len(title) < 2:
+        title = (title + "  ")[:2]
     if identifier == "youtube":
         return {
             "__type": "youtube",
@@ -84,6 +132,7 @@ def build_now_payload(
         })
     return {
         "type": "now",
+        "date": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "shortLink": False,
         "tags": [],
         "posts": posts,
@@ -107,36 +156,49 @@ class PostizClient:
         platforms = platforms or list(DEFAULT_PLATFORMS)
         video = Path(video)
         with httpx.Client(timeout=180.0) as client:
-            list_resp = client.get(f"{self.base_url}/integrations", headers=self._headers())
+            try:
+                list_resp = client.get(f"{self.base_url}/integrations", headers=self._headers())
+            except Exception as e:
+                _reraise_postiz_transport(e, phase="integrations list")
             list_resp.raise_for_status()
             rows = list_resp.json()
             if isinstance(rows, dict):
                 rows = rows.get("integrations") or rows.get("data") or []
             targets = filter_target_integrations(rows, platforms)
             if not targets:
-                raise RuntimeError(
+                raise PostizPublishError(
                     "Nenhuma integração Postiz alvo conectada "
                     f"(pedido: {', '.join(platforms)})"
                 )
 
             with video.open("rb") as fh:
-                upload_resp = client.post(
-                    f"{self.base_url}/upload",
-                    headers=self._headers(),
-                    files={"file": (video.name, fh, "video/mp4")},
-                )
+                try:
+                    upload_resp = client.post(
+                        f"{self.base_url}/upload",
+                        headers=self._headers(),
+                        files={"file": (video.name, fh, "video/mp4")},
+                    )
+                except Exception as e:
+                    _reraise_postiz_transport(e, phase="upload")
             upload_resp.raise_for_status()
             media = upload_resp.json()
 
             payload = build_now_payload(targets, media, copy)
-            create_resp = client.post(
-                f"{self.base_url}/posts",
-                headers=self._headers(),
-                json=payload,
-            )
-            create_resp.raise_for_status()
+            try:
+                create_resp = client.post(
+                    f"{self.base_url}/posts",
+                    headers=self._headers(),
+                    json=payload,
+                )
+            except Exception as e:
+                _reraise_postiz_transport(e, phase="create")
+
+            if create_resp.is_error:
+                raise PostizPublishError(
+                    f"Postiz {create_resp.status_code}: {create_resp.text[:500]}"
+                )
             return {
                 "media": media,
                 "posted": True,
-                "response": create_resp.json(),
+                "response": parse_response_json(create_resp),
             }

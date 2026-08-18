@@ -1,6 +1,9 @@
 # Secrets
 .env
 .api
+cookies.txt
+*.work
+*.work.seed
 
 # Output
 clips/
