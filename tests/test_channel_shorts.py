@@ -342,6 +342,7 @@ def test_list_channel_shorts_passes_cookies(tmp_path, monkeypatch):
     cookies = tmp_path / "cookies.txt"
     cookies.write_text("# Netscape HTTP Cookie File\n")
     monkeypatch.setenv("CLIPPER_YOUTUBE_COOKIES", str(cookies))
+    monkeypatch.setenv("CLIPPER_YOUTUBE_USE_COOKIES", "1")
     payload = {"title": "Renan", "entries": [{"id": "a", "title": "x", "view_count": 1, "duration": 10}]}
     mock_run = MagicMock()
     mock_run.return_value.returncode = 0
@@ -364,6 +365,7 @@ def test_download_shorts_passes_cookies(tmp_path, monkeypatch):
     cookies = tmp_path / "cookies.txt"
     cookies.write_text("# Netscape HTTP Cookie File\n")
     monkeypatch.setenv("CLIPPER_YOUTUBE_COOKIES", str(cookies))
+    monkeypatch.setenv("CLIPPER_YOUTUBE_USE_COOKIES", "1")
     captured: list[list[str]] = []
 
     def fake_run(cmd, **kwargs):

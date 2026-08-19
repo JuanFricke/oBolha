@@ -11,10 +11,11 @@ CLI usage:
   python obolha.py shorts @Canal --top 10
   python obolha.py auto-react [--force]
   python obolha.py watch [--channel @handle] [--once]
+  python obolha.py aura <url_or_file>   # clipes aura (discurso RS + filtro jaguar)
   python obolha.py web [--host 127.0.0.1] [--port 8765]
 
 Python API (for AI agents / scripts):
-  from obolha import clip_videos, compose_facecam
+  from obolha import clip_videos, clip_aura_videos, compose_facecam
   results = clip_videos(["https://youtu.be/XYZ"])
   compose_facecam("clips/01_clip.mp4", "webcam.mp4")
 
@@ -134,6 +135,14 @@ CFG = {
     "output_dir":          Path(os.getenv("CLIPPER_CLIPS_DIR", _legacy_output or "./clips")),
     "workers":             int(os.getenv("CLIPPER_WORKERS", "3")),
     "whisper_model":       os.getenv("CLIPPER_WHISPER_MODEL", "base"),
+    "aura_dir":            Path(os.getenv("CLIPPER_AURA_DIR", "./aura")),
+    "aura_texture_path":   os.getenv("CLIPPER_AURA_TEXTURE", ""),
+    "aura_max_clips":      int(os.getenv("CLIPPER_AURA_MAX_CLIPS", "10")),
+    "aura_min_duration":   int(os.getenv("CLIPPER_AURA_MIN_DURATION", "15")),
+    "aura_max_duration":   int(os.getenv("CLIPPER_AURA_MAX_DURATION", "90")),
+    "aura_square_size":    int(os.getenv("CLIPPER_AURA_SQUARE_SIZE", "1080")),
+    "aura_enable_texture": os.getenv("CLIPPER_AURA_ENABLE_TEXTURE", "").strip().lower() in ("1", "true", "yes"),
+    "llm_max_tokens":      int(os.getenv("CLIPPER_LLM_MAX_TOKENS", "8192")),
 }
 
 
@@ -147,6 +156,10 @@ def get_reacts_dir() -> Path:
 
 def get_reacts_source_dir() -> Path:
     return Path(CFG["reacts_source_dir"])
+
+
+def get_aura_dir() -> Path:
+    return Path(CFG["aura_dir"])
 
 
 def _sync_output_dir_alias():
@@ -220,6 +233,7 @@ class JobStatus:
             "transcrevendo":"blue",
             "analisando":   "magenta",
             "cortando":     "yellow",
+            "filtrando":    "magenta",
             "concluído":    "green",
             "erro":         "red",
         }
@@ -293,6 +307,106 @@ def seconds_to_ts(s: float) -> str:
 
 def safe_filename(s: str) -> str:
     return re.sub(r"[^\w\-_\. ]", "_", s)[:60].strip()
+
+
+def is_youtube_url(url: str) -> bool:
+    return bool(re.search(r"(youtube\.com|youtu\.be)", url, re.IGNORECASE))
+
+
+def _format_yt_dlp_error(stderr: str) -> str:
+    stderr = (stderr or "").strip()
+    hint = ""
+    lower = stderr.lower()
+    if "needs to be reloaded" in lower or "sign in" in lower or "bot" in lower:
+        hint = " Tente atualizar o yt-dlp (uv sync --upgrade-package yt-dlp)."
+    tail = stderr[-800:] if len(stderr) > 800 else stderr
+    return f"yt-dlp falhou: {tail}{hint}"
+
+
+def _cleanup_work_dir(work_dir: Path | None) -> None:
+    if work_dir is None or not work_dir.exists():
+        return
+    for f in work_dir.glob("video*"):
+        f.unlink(missing_ok=True)
+    subs = work_dir / "subs"
+    if subs.is_dir():
+        for f in subs.glob("*"):
+            f.unlink(missing_ok=True)
+        try:
+            subs.rmdir()
+        except OSError:
+            pass
+    try:
+        work_dir.rmdir()
+    except OSError:
+        pass
+
+
+def ffmpeg_square_crop_vf(size: int = 1080) -> str:
+    """Center-crop to 1:1 and scale to size×size (crop sides or top/bottom as needed)."""
+    return (
+        f"scale={size}:{size}:force_original_aspect_ratio=increase,"
+        f"crop={size}:{size}"
+    )
+
+
+def ffmpeg_cut_segment(
+    video_path: Path,
+    start: float,
+    end: float,
+    output: Path,
+    *,
+    timeout: int = 300,
+    square_size: int | None = None,
+) -> None:
+    """Cut [start, end] from video; stream copy first, re-encode on failure."""
+    duration = max(0.1, end - start)
+    if square_size:
+        encode_cmd = [
+            "ffmpeg", "-y",
+            "-ss", f"{start:.2f}",
+            "-i", str(video_path),
+            "-t", f"{duration:.2f}",
+            "-vf", ffmpeg_square_crop_vf(square_size),
+            *video_encode_args(get_video_encoder()),
+            "-c:a", "aac", "-b:a", "128k",
+            str(output),
+        ]
+        result = subprocess.run(encode_cmd, capture_output=True, text=True, timeout=timeout)
+        if result.returncode != 0 or not output.is_file():
+            raise RuntimeError(f"ffmpeg square cut failed: {(result.stderr or '')[-400:]}")
+        return
+
+    copy_cmd = [
+        "ffmpeg", "-y",
+        "-ss", f"{start:.2f}",
+        "-to", f"{end:.2f}",
+        "-i", str(video_path),
+        "-c", "copy",
+        "-avoid_negative_ts", "make_zero",
+        str(output),
+    ]
+    result = subprocess.run(copy_cmd, capture_output=True, text=True, timeout=timeout)
+    if (
+        result.returncode == 0
+        and output.is_file()
+        and output.stat().st_size >= MIN_VALID_MEDIA_BYTES
+    ):
+        return
+
+    output.unlink(missing_ok=True)
+    encode_cmd = [
+        "ffmpeg", "-y",
+        "-ss", f"{start:.2f}",
+        "-i", str(video_path),
+        "-t", f"{duration:.2f}",
+        *video_encode_args(get_video_encoder()),
+        "-c:a", "aac", "-b:a", "128k",
+        str(output),
+    ]
+    result = subprocess.run(encode_cmd, capture_output=True, text=True, timeout=timeout)
+    if result.returncode != 0 or not output.is_file():
+        raise RuntimeError(f"ffmpeg cut failed: {(result.stderr or '')[-400:]}")
 
 class MissingDependencyError(RuntimeError):
     """Raised when a required system tool or Python package is missing."""
@@ -414,6 +528,29 @@ def check_deps(raise_on_error: bool = False):
             sys.exit(1)
 
 
+def check_filter_deps(raise_on_error: bool = False):
+    """Verify opencv/scipy/moviepy for jaguar sepia aura pipeline."""
+    missing = []
+    try:
+        import cv2  # noqa: F401
+    except ImportError:
+        missing.append("opencv-python → uv sync --extra filter")
+    try:
+        import scipy  # noqa: F401
+    except ImportError:
+        missing.append("scipy → uv sync --extra filter")
+    try:
+        import moviepy  # noqa: F401
+    except ImportError:
+        missing.append("moviepy → uv sync --extra filter")
+    if missing:
+        msg = "Missing filter dependencies:\n" + "\n".join(f"  • {m}" for m in missing)
+        if raise_on_error:
+            raise MissingDependencyError(msg)
+        print(f"\n[ERRO] {msg}\n")
+        sys.exit(1)
+
+
 def check_download_deps(raise_on_error: bool = False):
     """Verify yt-dlp + ffmpeg + ffprobe (no LLM keys required)."""
     missing = []
@@ -446,17 +583,20 @@ def load_local_video(source: str, job: JobStatus) -> tuple[Path, str, list]:
     job.title = title[:50]
     log(f"Local file: {video_path.name}")
     return video_path, title, []  # no subtitle files
-def download_video(url: str, work_dir: Path, job: JobStatus) -> tuple[Path, str]:
-    """Baixa vídeo e retorna (caminho_video, titulo)"""
+def download_video(url: str, work_dir: Path, job: JobStatus) -> tuple[Path, str, list[Path]]:
+    """Baixa vídeo e retorna (caminho_video, titulo, legendas)."""
     job.status = "baixando"
     log(f"Baixando: {url}")
 
-    # Pega título primeiro
     title_result = subprocess.run(
         ["yt-dlp", *yt_dlp_youtube_args(), "--get-title", "--no-playlist", url],
-        capture_output=True, text=True, timeout=30
+        capture_output=True, text=True, timeout=30,
     )
-    title = title_result.stdout.strip() or url
+    if title_result.returncode != 0:
+        raise RuntimeError(_format_yt_dlp_error(title_result.stderr or title_result.stdout))
+    title = title_result.stdout.strip()
+    if not title:
+        raise RuntimeError("yt-dlp retornou título vazio")
     job.title = title[:50]
     log(f"Título: {title}")
 
@@ -492,7 +632,7 @@ def download_video(url: str, work_dir: Path, job: JobStatus) -> tuple[Path, str]
     ], capture_output=True, text=True, timeout=600)
 
     if dl_result.returncode != 0:
-        raise RuntimeError(f"yt-dlp falhou: {dl_result.stderr[-300:]}")
+        raise RuntimeError(_format_yt_dlp_error(dl_result.stderr))
 
     # Verifica arquivo baixado (nome pode diferir)
     candidates = list(work_dir.glob("video*.mp4"))
@@ -565,6 +705,14 @@ def _seed_cookie_jar(source: Path, work: Path) -> None:
     _write_private_file(seed, src_hash.encode())
 
 
+def _youtube_cookies_enabled() -> bool:
+    """Cookies are opt-in (VPS/watch). Local clip/aura defaults to --no-cookies."""
+    flag = os.getenv("CLIPPER_YOUTUBE_USE_COOKIES", "").strip().lower()
+    if flag not in ("1", "true", "yes"):
+        return False
+    return _cookie_source_path().is_file()
+
+
 def yt_dlp_cookie_args() -> list[str]:
     """Give yt-dlp a persistent, writable cookie jar so rotated cookies survive.
 
@@ -599,11 +747,17 @@ def clear_yt_dlp_cookie_jar() -> None:
 
 
 def yt_dlp_youtube_args() -> list[str]:
-    """Cookies plus a cookie-capable YouTube client (android_vr ignores cookies)."""
+    """Default: no-cookie mode (android+web). Opt-in cookies for VPS via CLIPPER_YOUTUBE_USE_COOKIES=1."""
+    if _youtube_cookies_enabled():
+        return [
+            *yt_dlp_cookie_args(),
+            "--extractor-args",
+            "youtube:player_client=tv,tv_downgraded",
+        ]
     return [
-        *yt_dlp_cookie_args(),
+        "--no-cookies",
         "--extractor-args",
-        "youtube:player_client=tv,tv_downgraded",
+        "youtube:player_client=android,web",
     ]
 
 
@@ -1209,6 +1363,111 @@ Ordene `clips` por `score_final` decrescente.
 Devolva no máximo {max_clips} cortes com `score_final` >= 6.5. Se nenhum trecho atingir esse patamar, devolva `"clips": []` e explique em `resumo`.
 """
 
+AURA_SYSTEM_PROMPT = """Você é um agente especialista em curadoria de clipes virais para redes sociais (Reels, Shorts, TikTok), focado no criador de conteúdo político Renan Santos.
+
+Sua função: receber a transcrição segmentada com timestamps de um vídeo/live e devolver os "momentos aura" com maior potencial de viralização — prontos para corte vertical com tratamento visual dramático.
+
+## ENTRADA
+
+Você recebe:
+- METADADOS: título, participantes, contexto e duração do vídeo.
+- SEGMENTOS: `[índice] start=<seg> end=<seg> speaker=<id>: texto`.
+
+Timestamps em segundos (float). NUNCA invente `start`/`end`: use apenas fronteiras de segmentos existentes.
+
+## ORDEM DE PRIORIDADE (hierárquica — não negociável)
+
+1º) POTENCIAL DE VIRALIZAÇÃO — critério dominante. Selecione mesmo SEM proposta programática se o trecho tiver alto potencial de aura/viral.
+2º) QUALIDADE DA PROPOSTA — desempate e bônus de nota, NUNCA motivo isolado de seleção. Proposta interessante com entrega monótona, didática ou sem gancho = nota baixa.
+
+Use `scores.proposta` (0-10) só para desempate e contexto em `motivo`. `score_final` = média dos seis scores virais abaixo (não inclua `proposta` na média).
+
+## O QUE CONTA COMO "MOMENTO AURA"
+
+- Frase de efeito, punchline ou virada retórica ("call-back") — corte pronto
+- Tom de confronto, ironia, sarcasmo ou deboche contra adversário/sistema/mídia
+- Firmeza extrema na entrega (sem gaguejar): fala seca, "cara de poucos amigos"
+- Analogias, comparações ou frases curtas quotáveis (thumbnail/legenda)
+- Reação de público (risada, aplauso, silêncio tenso) perceptível no contexto
+- Contraste forte: "eles fazem X, eu vou fazer Y"
+- Gancho nos primeiros 3-5 segundos (sem gancho inicial, o corte morre no scroll)
+- Fechamento com frase de impacto (bom para loop/replay)
+- Bônus (não substitui aura): proposta política concreta e clara no trecho
+
+## O QUE DERRUBA A NOTA
+
+- Trecho truncado no meio da ideia (início ou fim cortando o raciocínio)
+- Tom de aula/palestra sem tensão, sem "vilão", sem contraste
+- Dependência de contexto externo não explicado no próprio trecho
+- Ironia/humor passível de má interpretação fora de contexto — sinalize em `alerta` mesmo com nota alta de viralização
+- Vinhetas, apresentações, publicidade, agradecimentos, regimento, papo burocrático
+
+## CRITÉRIOS VIRAIS (scores 0-10 cada)
+
+1. HOOK: primeiros 3-5s prendem com impacto imediato.
+2. AUTOSSUFICIÊNCIA: entende-se sem o resto do vídeo (inclua pergunta do entrevistador se necessário).
+3. CARGA EMOCIONAL: indignação, fervor, ironia, revelação, confronto.
+4. CITABILIDADE: frase printável para legenda/thumbnail.
+5. TENSÃO: acusação, contraste, promessa ousada, crítica nominal.
+6. FECHAMENTO: termina em clímax ou punchline — nunca no meio do raciocínio.
+
+## DURAÇÃO
+
+- Ideal editorial: 15 a 60 segundos (vertical).
+- Faixa aceita neste job: {min_dur} a {max_dur} segundos.
+- Até {max_dur}s só se o trecho for indivisível sem perder o aura.
+- Nunca aprovar cortes abaixo de 8 segundos.
+- Comece e termine em fronteira de frase. Sem sobreposição entre cortes.
+
+## RESPONSABILIDADE EDITORIAL
+
+Avalie `risco_descontextualizacao` (baixo/medio/alto). Se distorcer a fala ao isolar o trecho, marque "alto" e explique em `alerta`.
+`hook_quote` e `transcript` devem ser verbatim da transcrição.
+
+## SAÍDA
+
+Responda APENAS com JSON válido (sem markdown):
+
+{{
+  "clips": [
+    {{
+      "id": 1,
+      "start": 412.88,
+      "end": 468.20,
+      "duration": 55.32,
+      "segment_range": [87, 96],
+      "tema": "confronto com a mídia",
+      "hook_quote": "frase verbatim dos primeiros segundos",
+      "transcript": "texto verbatim completo do corte",
+      "titulo": "título até 60 caracteres",
+      "legenda": "legenda para post, 1-2 frases",
+      "hashtags": ["#renansantos", "#politica", "#shorts"],
+      "scores": {{
+        "hook": 9,
+        "autossuficiencia": 8,
+        "emocao": 10,
+        "citabilidade": 9,
+        "tensao": 8,
+        "fechamento": 9,
+        "proposta": 6
+      }},
+      "score_final": 8.8,
+      "motivo": "por que viraliza; mencione proposta só se existir",
+      "risco_descontextualizacao": "baixo",
+      "alerta": null
+    }}
+  ],
+  "resumo": "tom do vídeo e onde estão os picos de aura"
+}}
+
+`score_final` = média de hook, autossuficiencia, emocao, citabilidade, tensao, fechamento (1 decimal).
+Ordene por `score_final` decrescente; desempate por `scores.proposta`.
+No trecho recebido, devolva até {max_clips} cortes com `score_final` >= 5.5.
+Prefira os melhores candidatos do trecho a `"clips": []` — só devolva lista vazia se o chunk for
+100% burocrático (vinheta, intervalo, agradecimento sem conteúdo).
+Responda APENAS JSON puro (sem markdown, sem ```).
+"""
+
 
 def chunk_transcript(segments: list[dict], max_chars: int = 12000) -> list[str]:
     """Divide transcript em chunks respeitando tamanho de contexto"""
@@ -1235,20 +1494,72 @@ def chunk_transcript(segments: list[dict], max_chars: int = 12000) -> list[str]:
     return chunks
 
 
+def _strip_llm_json_wrapper(raw: str) -> str:
+    """Remove markdown code fences around JSON."""
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, count=1, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```\s*$", "", text)
+    return text.strip()
+
+
+def _salvage_clips_from_truncated_json(text: str) -> list[dict]:
+    """Extrai objetos completos de clips[] quando o JSON veio truncado."""
+    match = re.search(r'"clips"\s*:\s*\[', text)
+    if not match:
+        return []
+
+    salvaged: list[dict] = []
+    i = match.end()
+    while i < len(text):
+        while i < len(text) and text[i] in " \n\r\t,":
+            i += 1
+        if i >= len(text) or text[i] == "]":
+            break
+        if text[i] != "{":
+            break
+
+        depth = 0
+        start = i
+        for j in range(i, len(text)):
+            ch = text[j]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        obj = json.loads(text[start : j + 1])
+                    except Exception:
+                        obj = None
+                    if isinstance(obj, dict) and "start" in obj and "end" in obj:
+                        salvaged.append(obj)
+                    i = j + 1
+                    break
+        else:
+            break
+    return salvaged
+
+
 def _parse_llm_json(raw: str) -> tuple[list[dict], str]:
     """Extrai clips e resumo do retorno JSON do LLM."""
-    json_match = re.search(r"\{.*\}", raw, re.DOTALL)
+    text = _strip_llm_json_wrapper(raw)
+
+    json_match = re.search(r"\{.*", text, re.DOTALL)
     if json_match:
+        payload = json_match.group()
         try:
-            data = json.loads(json_match.group())
+            data = json.loads(payload)
             if isinstance(data, dict):
                 clips = data.get("clips", [])
                 resumo = data.get("resumo", "")
                 return clips, resumo
         except Exception:
-            pass
+            salvaged = _salvage_clips_from_truncated_json(payload)
+            if salvaged:
+                return salvaged, ""
 
-    array_match = re.search(r"\[.*\]", raw, re.DOTALL)
+    array_match = re.search(r"\[.*\]", text, re.DOTALL)
     if array_match:
         try:
             clips = json.loads(array_match.group())
@@ -1258,6 +1569,16 @@ def _parse_llm_json(raw: str) -> tuple[list[dict], str]:
             pass
 
     return [], ""
+
+
+def _llm_debug_enabled() -> bool:
+    return os.environ.get("CLIPPER_AURA_DEBUG", "").strip() in ("1", "true", "yes")
+
+
+def _per_chunk_clip_limit(max_clips: int, chunk_count: int) -> int:
+    if chunk_count <= 0:
+        return max(1, max_clips)
+    return max(1, min(3, (max_clips + chunk_count - 1) // chunk_count))
 
 
 def validate_and_dedup_clips(
@@ -1279,8 +1600,7 @@ def validate_and_dedup_clips(
                 continue
             dur = end - start
             score = float(c.get("score_final", c.get("score_total", 0)))
-            # Aceita 20s+ se punchline for excelente ou se estiver na faixa
-            if dur < 20.0 or dur > (max_duration + 30):
+            if dur < min_duration or dur > (max_duration + 30):
                 continue
             c["start"] = start
             c["end"] = end
@@ -1311,21 +1631,57 @@ def validate_and_dedup_clips(
     return selected
 
 
-def analyze_with_llm(segments: list[dict], title: str, job: JobStatus) -> list[dict]:
+def analyze_with_llm(
+    segments: list[dict],
+    title: str,
+    job: JobStatus,
+    *,
+    system_prompt_template: str | None = None,
+    context: str = "podcast / discurso / entrevista",
+    participants: str = "desconhecido",
+    max_clips: int | None = None,
+    min_duration: int | None = None,
+    max_duration: int | None = None,
+    max_tokens: int | None = None,
+) -> list[dict]:
     """Envia transcript pro LLM (Groq ou Gemini/Antigravity) e recebe timestamps dos melhores clips"""
     job.status = "analisando"
     active_prov = CFG.get("active_provider", CFG.get("provider", "anthropic"))
     log(f"Analisando com LLM ({active_prov}:{CFG['model']}): {len(segments)} segmentos")
 
-    system = SYSTEM_PROMPT.format(
-        min_dur=CFG["min_duration"],
-        max_dur=CFG["max_duration"],
-        max_clips=CFG["max_clips"],
-    )
+    min_dur = min_duration if min_duration is not None else CFG["min_duration"]
+    max_dur = max_duration if max_duration is not None else CFG["max_duration"]
+    max_clip_count = max_clips if max_clips is not None else CFG["max_clips"]
+    token_budget = max_tokens if max_tokens is not None else CFG["llm_max_tokens"]
+    template = system_prompt_template or SYSTEM_PROMPT
 
     chunks = chunk_transcript(segments)
+    per_chunk = _per_chunk_clip_limit(max_clip_count, len(chunks))
+    system = template.format(
+        min_dur=min_dur,
+        max_dur=max_dur,
+        max_clips=per_chunk,
+    )
+
     all_clips = []
     dur_total = segments[-1]["end"] if segments else 0
+    debug = _llm_debug_enabled()
+
+    def _handle_llm_response(raw: str, chunk_idx: int) -> None:
+        clips, resumo = _parse_llm_json(raw)
+        all_clips.extend(clips)
+        log(f"LLM retornou {len(clips)} clips do chunk {chunk_idx + 1}")
+        if debug:
+            if resumo:
+                log(f"LLM resumo chunk {chunk_idx + 1}: {resumo[:240]}")
+            if not clips and '"clips"' in raw:
+                log(
+                    f"LLM chunk {chunk_idx + 1}: JSON truncado ou inválido "
+                    f"({len(raw)} chars). Tail: ...{raw[-200:]}",
+                    "warn",
+                )
+            elif not clips:
+                log(f"LLM chunk {chunk_idx + 1}: resposta sem clips. Head: {raw[:240]}", "warn")
 
     if active_prov in ("gemini", "antigravity"):
         if not HAS_GENAI or genai is None:
@@ -1337,10 +1693,11 @@ def analyze_with_llm(segments: list[dict], title: str, job: JobStatus) -> list[d
             log(f"LLM chunk {i+1}/{len(chunks)}")
             user_msg = f"""METADADOS
 titulo: "{title}"
-participantes: "desconhecido"
-contexto: "podcast / discurso / entrevista"
+participantes: "{participants}"
+contexto: "{context}"
 duracao_total_s: {dur_total:.2f}
-max_cortes: {CFG['max_clips']}
+max_cortes_total: {max_clip_count}
+max_cortes_neste_trecho: {per_chunk}
 
 SEGMENTOS
 {chunk}"""
@@ -1352,13 +1709,11 @@ SEGMENTOS
                     config={
                         "system_instruction": system,
                         "temperature": 0.3,
-                        "max_output_tokens": 2000,
+                        "max_output_tokens": token_budget,
                     },
                 )
                 raw = response.text.strip()
-                clips, _ = _parse_llm_json(raw)
-                all_clips.extend(clips)
-                log(f"LLM retornou {len(clips)} clips do chunk {i+1}")
+                _handle_llm_response(raw, i)
             except Exception as e:
                 log(f"Erro LLM chunk {i+1}: {e}", "warn")
                 continue
@@ -1372,10 +1727,11 @@ SEGMENTOS
             log(f"LLM chunk {i+1}/{len(chunks)}")
             user_msg = f"""METADADOS
 titulo: "{title}"
-participantes: "desconhecido"
-contexto: "podcast / discurso / entrevista"
+participantes: "{participants}"
+contexto: "{context}"
 duracao_total_s: {dur_total:.2f}
-max_cortes: {CFG['max_clips']}
+max_cortes_total: {max_clip_count}
+max_cortes_neste_trecho: {per_chunk}
 
 SEGMENTOS
 {chunk}"""
@@ -1383,15 +1739,13 @@ SEGMENTOS
             try:
                 response = client.messages.create(
                     model=ANTHROPIC_HAIKU_MODEL,
-                    max_tokens=2000,
+                    max_tokens=token_budget,
                     temperature=0.3,
                     system=system,
                     messages=[{"role": "user", "content": user_msg}],
                 )
                 raw = response.content[0].text.strip()
-                clips, _ = _parse_llm_json(raw)
-                all_clips.extend(clips)
-                log(f"LLM retornou {len(clips)} clips do chunk {i+1}")
+                _handle_llm_response(raw, i)
             except Exception as e:
                 log(f"Erro LLM chunk {i+1}: {e}", "warn")
                 continue
@@ -1405,10 +1759,11 @@ SEGMENTOS
             log(f"LLM chunk {i+1}/{len(chunks)}")
             user_msg = f"""METADADOS
 titulo: "{title}"
-participantes: "desconhecido"
-contexto: "podcast / discurso / entrevista"
+participantes: "{participants}"
+contexto: "{context}"
 duracao_total_s: {dur_total:.2f}
-max_cortes: {CFG['max_clips']}
+max_cortes_total: {max_clip_count}
+max_cortes_neste_trecho: {per_chunk}
 
 SEGMENTOS
 {chunk}"""
@@ -1421,26 +1776,24 @@ SEGMENTOS
                         {"role": "user",   "content": user_msg},
                     ],
                     temperature=0.3,
-                    max_tokens=2000,
+                    max_tokens=token_budget,
                 )
                 raw = response.choices[0].message.content.strip()
-                clips, _ = _parse_llm_json(raw)
-                all_clips.extend(clips)
-                log(f"LLM retornou {len(clips)} clips do chunk {i+1}")
+                _handle_llm_response(raw, i)
             except Exception as e:
                 log(f"Erro LLM chunk {i+1}: {e}", "warn")
                 continue
 
     result = validate_and_dedup_clips(
         all_clips,
-        max_clips=CFG["max_clips"],
-        min_duration=CFG["min_duration"],
-        max_duration=CFG["max_duration"],
+        max_clips=max_clip_count,
+        min_duration=min_dur,
+        max_duration=max_dur,
     )
 
     if not result and all_clips:
         # Fallback se a filtragem estrita remover tudo
-        result = all_clips[:CFG["max_clips"]]
+        result = all_clips[:max_clip_count]
 
     if not result:
         raise RuntimeError("LLM não retornou nenhum clip válido")
@@ -1654,6 +2007,121 @@ def cut_clips(
     log(f"Manifest salvo: {manifest_path}", "ok")
     return results
 
+
+def cut_aura_clips(
+    video_path: Path,
+    clips: list[dict],
+    output_dir: Path,
+    title: str,
+    job: JobStatus,
+    texture_path: str | Path | None = None,
+    filter_params: dict | None = None,
+) -> list[dict]:
+    """Cut clips and apply jaguar sepia filter (aura category)."""
+    from jaguar_sepia_filter import process_video as apply_jaguar_filter
+
+    job.status = "cortando"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    filter_params = dict(filter_params or {})
+    filter_params.setdefault("show_progress", False)
+    filter_params.setdefault("enable_texture", bool(CFG.get("aura_enable_texture", False)))
+    results = []
+    failures = 0
+    last_error = ""
+
+    texture = texture_path or CFG.get("aura_texture_path") or None
+    if texture == "":
+        texture = None
+
+    for i, clip in enumerate(clips, 1):
+        try:
+            start_s = ts_to_seconds(clip["start"])
+            end_s = ts_to_seconds(clip["end"])
+            start_padded = max(0.0, start_s - 0.3)
+            end_padded = end_s + 0.5
+            duration = end_padded - start_padded
+
+            clip_title = safe_filename(clip.get("titulo", f"aura_{i}"))
+            scores = clip.get("scores", {})
+            score_final = float(clip.get("score_final", clip.get("score_total", 0)))
+
+            filename = f"{i:02d}_{clip_title}_score{score_final:.1f}.mp4"
+            out_path = output_dir / filename
+            raw_path = out_path.with_suffix(".raw.mp4")
+
+            try:
+                ffmpeg_cut_segment(
+                    video_path,
+                    start_padded,
+                    end_padded,
+                    raw_path,
+                    square_size=CFG.get("aura_square_size") or None,
+                )
+            except RuntimeError as e:
+                failures += 1
+                last_error = str(e)
+                log(f"ffmpeg erro aura clip {i}: {e}", "warn")
+                continue
+
+            job.status = "filtrando"
+            try:
+                apply_jaguar_filter(str(raw_path), str(out_path), texture_path=texture, **filter_params)
+            except Exception as e:
+                failures += 1
+                last_error = str(e)
+                log(f"Filtro jaguar falhou no clip {i}: {e}", "warn")
+                log(f"  raw preservado para retry: {raw_path}", "warn")
+                continue
+            raw_path.unlink(missing_ok=True)
+
+            if not out_path.exists():
+                failures += 1
+                log(f"Aura clip {i} não gerado", "warn")
+                continue
+
+            size_mb = out_path.stat().st_size / 1024 / 1024
+            log(f"✓ Aura {i}: {filename} ({duration:.1f}s, {size_mb:.1f}MB)", "ok")
+            results.append({
+                "file": str(out_path),
+                "category": "aura",
+                "titulo": clip.get("titulo"),
+                "resumo": clip.get("resumo"),
+                "legenda": clip.get("legenda"),
+                "hashtags": clip.get("hashtags", []),
+                "tema": clip.get("tema"),
+                "hook_quote": clip.get("hook_quote"),
+                "motivo": clip.get("motivo"),
+                "risco_descontextualizacao": clip.get("risco_descontextualizacao", "baixo"),
+                "alerta": clip.get("alerta"),
+                "scores": scores,
+                "score_final": score_final,
+                "score_total": score_final,
+                "duration": duration,
+                "size_mb": size_mb,
+            })
+            job.clips_done += 1
+        except Exception as e:
+            failures += 1
+            last_error = str(e)
+            log(f"Erro aura clip {i}: {e}", "warn")
+
+    if clips and not results:
+        detail = f": {last_error}" if last_error else ""
+        raise RuntimeError(
+            f"Nenhum clip aura gerado ({len(clips)} candidatos, {failures} falha(s){detail})"
+        )
+
+    manifest_path = output_dir / "manifest.json"
+    manifest = {
+        "video_title": title,
+        "category": "aura",
+        "processed_at": datetime.now().isoformat(),
+        "clips": results,
+    }
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2))
+    log(f"Manifest aura salvo: {manifest_path}", "ok")
+    return results
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Facecam compose — 9:16 (TikTok / Shorts) layout
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1669,9 +2137,9 @@ _VIDEO_ENCODER_CANDIDATES = [
     "libopenh264",
     "h264_nvenc",
     "h264_amf",
-    "h264_v4l2m2m",
-    "h264_qsv",
     "mpeg4",
+    "h264_qsv",
+    "h264_v4l2m2m",
 ]
 _encoder_cache: Optional[str] = None
 _encoders_stdout_cache: Optional[str] = None
@@ -2336,50 +2804,93 @@ def run_watch_once(channel: str) -> dict:
 # ──────────────────────────────────────────────────────────────────────────────
 def process_video(url: str, job: JobStatus):
     """Roda o pipeline completo para uma URL ou arquivo local."""
+    work_dir: Path | None = None
     try:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        work_dir = get_clips_dir() / f"tmp_{ts}_{abs(hash(url)) % 9999}"
-        work_dir.mkdir(parents=True, exist_ok=True)
-
-        # 1. Download (or use local file directly)
         if is_local_file(url):
             video_path, title, sub_files = load_local_video(url, job)
         else:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            work_dir = get_clips_dir() / f"tmp_{ts}_{abs(hash(url)) % 9999}"
+            work_dir.mkdir(parents=True, exist_ok=True)
             video_path, title, sub_files = download_video(url, work_dir, job)
         job.title = title[:50]
 
-        # 2. Transcrição
         segments = get_transcript(video_path, sub_files, job)
 
         if len(segments) < 5:
             raise RuntimeError(f"Transcrição insuficiente ({len(segments)} segmentos)")
 
-        # 3. LLM Analysis
         clips = analyze_with_llm(segments, title, job)
 
-        # 4. Corte
         out_dir = get_clips_dir() / safe_filename(title)
         results = cut_clips(video_path, clips, out_dir, title, job, segments=segments)
 
+        if not results:
+            raise RuntimeError(f"Nenhum clip gerado de {len(clips)} candidatos")
+
+        job.clips_found = len(clips)
+        job.clips_done = len(results)
         job.output_dir = out_dir
         job.status = "concluído"
         log(f"✓ Concluído: {title} → {len(results)} clips em {out_dir}", "ok")
-
-        # Limpa temporários (mantém apenas clips finais)
-        for f in work_dir.glob("video*"):
-            f.unlink(missing_ok=True)
-        for f in (work_dir / "subs").glob("*") if (work_dir / "subs").exists() else []:
-            f.unlink(missing_ok=True)
-        try:
-            (work_dir / "subs").rmdir()
-            work_dir.rmdir()
-        except OSError:
-            pass  # não vazio, ok
 
     except Exception as e:
         job.status = "erro"
         job.error = str(e)
         log(f"ERRO [{job.title or url}]: {e}", "err")
+    finally:
+        _cleanup_work_dir(work_dir)
+
+
+def process_aura_video(url: str, job: JobStatus):
+    """Pipeline aura: transcrição → LLM (aura) → corte → filtro jaguar sépia."""
+    work_dir: Path | None = None
+    try:
+        check_filter_deps(raise_on_error=True)
+
+        if is_local_file(url):
+            video_path, title, sub_files = load_local_video(url, job)
+        else:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            work_dir = get_aura_dir() / f"tmp_{ts}_{abs(hash(url)) % 9999}"
+            work_dir.mkdir(parents=True, exist_ok=True)
+            video_path, title, sub_files = download_video(url, work_dir, job)
+        job.title = title[:50]
+
+        segments = get_transcript(video_path, sub_files, job)
+        if len(segments) < 5:
+            raise RuntimeError(f"Transcrição insuficiente ({len(segments)} segmentos)")
+
+        clips = analyze_with_llm(
+            segments,
+            title,
+            job,
+            system_prompt_template=AURA_SYSTEM_PROMPT,
+            context="discurso / entrevista longa — clipes aura Renan Santos",
+            participants="Renan Santos",
+            max_clips=CFG["aura_max_clips"],
+            min_duration=CFG["aura_min_duration"],
+            max_duration=CFG["aura_max_duration"],
+        )
+
+        out_dir = get_aura_dir() / safe_filename(title)
+        results = cut_aura_clips(video_path, clips, out_dir, title, job)
+
+        if not results:
+            raise RuntimeError(f"Nenhum clip aura gerado de {len(clips)} candidatos")
+
+        job.clips_found = len(clips)
+        job.clips_done = len(results)
+        job.output_dir = out_dir
+        job.status = "concluído"
+        log(f"✓ Aura concluído: {title} → {len(results)} clips em {out_dir}", "ok")
+
+    except Exception as e:
+        job.status = "erro"
+        job.error = str(e)
+        log(f"ERRO aura [{job.title or url}]: {e}", "err")
+    finally:
+        _cleanup_work_dir(work_dir)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Interface de terminal com Rich Live
@@ -2409,9 +2920,12 @@ def print_summary():
 
     console.print(t)
 
-def run_with_live_display(urls: list[str]):
+def run_with_live_display(urls: list[str], processor=process_video):
     """Roda todos os jobs com display live atualizado"""
-    get_clips_dir().mkdir(parents=True, exist_ok=True)
+    if processor is process_aura_video:
+        get_aura_dir().mkdir(parents=True, exist_ok=True)
+    else:
+        get_clips_dir().mkdir(parents=True, exist_ok=True)
 
     # Cria jobs
     jobs = [add_job(url) for url in urls]
@@ -2429,24 +2943,26 @@ def run_with_live_display(urls: list[str]):
         print(f"\n[clipper] Processando {len(urls)} vídeo(s) com {CFG['workers']} worker(s)")
         print(f"Output: clips={CFG['clips_dir']} reacts={CFG['reacts_dir']}\n")
         with ThreadPoolExecutor(max_workers=CFG["workers"]) as executor:
-            futures = {executor.submit(process_video, url, job): job for url, job in zip(urls, jobs)}
+            futures = {executor.submit(processor, url, job): job for url, job in zip(urls, jobs)}
             for future in as_completed(futures):
                 pass
         print_summary()
         return
 
     # Com rich
+    label = "Aura" if processor is process_aura_video else "AI Video Clipper"
+    out_hint = get_aura_dir() if processor is process_aura_video else CFG["clips_dir"]
     console.print(Panel(
         f"[bold cyan]obolha[/bold cyan] — {len(urls)} vídeo(s) | "
-        f"{CFG['workers']} worker(s) | clips: [yellow]{CFG['clips_dir']}[/yellow] | reacts: [yellow]{CFG['reacts_dir']}[/yellow]",
-        title="[bold]AI Video Clipper[/bold]",
+        f"{CFG['workers']} worker(s) | output: [yellow]{out_hint}[/yellow]",
+        title=f"[bold]{label}[/bold]",
     ))
 
     finished = threading.Event()
 
     def run_jobs():
         with ThreadPoolExecutor(max_workers=CFG["workers"]) as executor:
-            futures = {executor.submit(process_video, url, job): job for url, job in zip(urls, jobs)}
+            futures = {executor.submit(processor, url, job): job for url, job in zip(urls, jobs)}
             for future in as_completed(futures):
                 pass
         finished.set()
@@ -2640,6 +3156,77 @@ def run_auto_react_cli():
         sys.exit(1)
 
 
+def parse_aura_args():
+    p = argparse.ArgumentParser(
+        description="Clipes aura — discursos/entrevistas Renan Santos com filtro jaguar sépia",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Exemplos:
+  python obolha.py aura https://youtu.be/XYZ
+  python obolha.py aura /caminho/discurso.mp4 --clips 5 --min 45 --max 120
+  python obolha.py aura --file discursos.txt -o ./meus_aura
+        """,
+    )
+    p.add_argument("urls", nargs="*", help="URL ou arquivo de vídeo longo")
+    p.add_argument("--file", "-f", metavar="FILE", help="Arquivo com URLs (uma por linha)")
+    p.add_argument("--clips", type=int, help=f"Máx clips aura (default: {CFG['aura_max_clips']})")
+    p.add_argument("--min", type=int, help=f"Duração mínima segundos (default: {CFG['aura_min_duration']})")
+    p.add_argument("--max", type=int, help=f"Duração máxima segundos (default: {CFG['aura_max_duration']})")
+    p.add_argument("--output", "-o", metavar="DIR", help=f"Pasta de saída (default: {CFG['aura_dir']})")
+    p.add_argument("--texture", metavar="FILE", help="Textura de onça (opcional)")
+    p.add_argument("--workers", "-w", type=int, help=f"Workers paralelos (default: {CFG['workers']})")
+    p.add_argument("--provider", choices=["auto", "groq", "gemini", "antigravity", "anthropic"])
+    p.add_argument("--lang", default=None)
+    p.add_argument("--model", default=None)
+    p.add_argument("--whisper", default=None)
+    return p.parse_args()
+
+
+def run_aura_cli():
+    args = parse_aura_args()
+    if args.provider:
+        CFG["provider"] = args.provider.lower()
+    if args.clips:
+        CFG["aura_max_clips"] = args.clips
+    if args.min:
+        CFG["aura_min_duration"] = args.min
+    if args.max:
+        CFG["aura_max_duration"] = args.max
+    if args.output:
+        CFG["aura_dir"] = Path(args.output)
+    if args.texture:
+        CFG["aura_texture_path"] = args.texture
+    if args.workers:
+        CFG["workers"] = args.workers
+    if args.lang:
+        CFG["lang"] = args.lang
+    if args.model:
+        CFG["model"] = args.model
+    if args.whisper:
+        CFG["whisper_model"] = args.whisper
+
+    check_deps()
+    check_filter_deps()
+
+    urls = list(args.urls)
+    if args.file:
+        file_path = Path(args.file)
+        if not file_path.exists():
+            print(f"[ERRO] Arquivo não encontrado: {args.file}")
+            sys.exit(1)
+        for line in file_path.read_text().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                urls.append(line)
+
+    if not urls:
+        print("[ERRO] Informe ao menos uma URL ou arquivo de vídeo.")
+        print("  python obolha.py aura https://youtu.be/XYZ")
+        sys.exit(1)
+
+    run_with_live_display(urls, processor=process_aura_video)
+
+
 def parse_watch_args():
     p = argparse.ArgumentParser(
         description="Watch a channel's latest short, fake-react, and post via Postiz",
@@ -2787,10 +3374,89 @@ def clip_videos(
         CFG.update(orig)
 
 
+def clip_aura_videos(
+    urls: list[str],
+    *,
+    provider: str | None = None,
+    max_clips: int | None = None,
+    min_duration: int | None = None,
+    max_duration: int | None = None,
+    output_dir: str | Path | None = None,
+    texture_path: str | Path | None = None,
+    workers: int | None = None,
+    lang: str | None = None,
+    model: str | None = None,
+    whisper_model: str | None = None,
+) -> list[dict]:
+    """
+    Extract aura clips from long-form Renan Santos speeches/interviews.
+
+    Same AI pipeline as clip_videos, but with aura-specific LLM prompt,
+    longer default durations, and jaguar sepia filter applied to each cut.
+
+    Requires: uv sync --extra filter (opencv, scipy, moviepy).
+    """
+    if not urls:
+        raise ValueError("urls must not be empty")
+
+    orig = dict(CFG)
+    try:
+        if provider is not None:
+            CFG["provider"] = provider.lower()
+        if max_clips is not None:
+            CFG["aura_max_clips"] = max_clips
+        if min_duration is not None:
+            CFG["aura_min_duration"] = min_duration
+        if max_duration is not None:
+            CFG["aura_max_duration"] = max_duration
+        if output_dir is not None:
+            CFG["aura_dir"] = Path(output_dir)
+        if texture_path is not None:
+            CFG["aura_texture_path"] = str(texture_path)
+        if workers is not None:
+            CFG["workers"] = workers
+        if lang is not None:
+            CFG["lang"] = lang
+        if model is not None:
+            CFG["model"] = model
+        if whisper_model is not None:
+            CFG["whisper_model"] = whisper_model
+
+        check_deps(raise_on_error=True)
+        check_filter_deps(raise_on_error=True)
+        get_aura_dir().mkdir(parents=True, exist_ok=True)
+
+        jobs = [add_job(url) for url in urls]
+
+        with ThreadPoolExecutor(max_workers=CFG["workers"]) as executor:
+            futures = {
+                executor.submit(process_aura_video, url, job): job
+                for url, job in zip(urls, jobs)
+            }
+            for future in as_completed(futures):
+                pass
+
+        all_clips = []
+        for job in jobs:
+            if job.output_dir:
+                manifest = job.output_dir / "manifest.json"
+                if manifest.exists():
+                    data = json.loads(manifest.read_text())
+                    all_clips.extend(data.get("clips", []))
+        return all_clips
+    finally:
+        CFG.update(orig)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "aura":
+        sys.argv.pop(1)
+        run_aura_cli()
+        return
+
     if len(sys.argv) > 1 and sys.argv[1] == "facecam":
         sys.argv.pop(1)  # remove 'facecam' so parse_facecam_args sees clip/facecam
         run_facecam_cli()
